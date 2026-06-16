@@ -4,6 +4,7 @@ import argparse
 import sys
 
 from wo_runtime.queue import commands as queue_commands
+from wo_runtime.runtime import fleet_plan, resolve, selftest as runtime_selftest, start, supervisor
 from wo_runtime.testing import run_synthetic_selftest
 from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, ensure_data_root, load_workspace
 
@@ -55,6 +56,26 @@ def _not_implemented(name: str):
     return _run
 
 
+def _dispatch_runtime(argv: list[str]) -> int:
+    if not argv:
+        print("usage: wo-runtime runtime {supervisor,resolve,start,fleet-plan,selftest} ...", file=sys.stderr)
+        return 2
+    command, rest = argv[0], argv[1:]
+    if command == "supervisor":
+        return supervisor.run(supervisor.parse_args(rest))
+    if command == "resolve":
+        resolve.main(rest)
+        return 0
+    if command == "start":
+        return start.main(rest)
+    if command == "fleet-plan":
+        return fleet_plan.main(rest)
+    if command == "selftest":
+        return runtime_selftest.main(rest)
+    print(f"wo-runtime: unknown runtime command '{command}'", file=sys.stderr)
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     workspace = _workspace_parent()
     parser = argparse.ArgumentParser(prog="wo-runtime")
@@ -92,6 +113,9 @@ def _ensure_data_root(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["runtime"]:
+        return _dispatch_runtime(argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     func = getattr(args, "func", None)
