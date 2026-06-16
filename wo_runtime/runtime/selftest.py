@@ -104,37 +104,29 @@ def test_runtime(name: str) -> None:
             check("[CONTEXT:" in out and "[/CONTEXT:" in out,
                   f"{name}: prepend for role '{sample}' includes CONTEXT markers")
             if by_kind:
+                sample_kind = next(iter(by_kind))
+                sample_spec = by_kind[sample_kind]
+                if isinstance(sample_spec, dict):
+                    sample_role = next((role for role in sample_spec if role != "*"), "*")
+                    sample_files = sample_spec.get(sample_role) or sample_spec.get("*") or []
+                else:
+                    sample_role = sample
+                    sample_files = sample_spec if isinstance(sample_spec, list) else []
+                sample_role = sample if sample_role == "*" else sample_role
                 with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
-                    json.dump({
-                        "domainId": "kids-printable-pdf",
-                        "product": {"productType": "activity_calendar", "title": "365 Screen-Free Activities"}
-                    }, f)
-                    activity_calendar_trigger = f.name
+                    json.dump({"productKind": sample_kind, "product": {"productType": sample_kind}}, f)
+                    trigger_path = f.name
                 try:
-                    activity_out = resolve_context_prepend(desc, "worker-content", ROOT, activity_calendar_trigger)
-                    check("alphabet-tracing-workbook" not in activity_out,
-                          f"{name}: activity-calendar context does not inject alphabet skill")
+                    out_by_kind = resolve_context_prepend(desc, sample_role, ROOT, trigger_path)
+                    if sample_files:
+                        expected = "[CONTEXT: " + str(sample_files[0]) + "]"
+                        check(expected in out_by_kind,
+                              f"{name}: product-kind context injects declared file for '{sample_kind}'")
                 finally:
                     try:
-                        os.unlink(activity_calendar_trigger)
+                        os.unlink(trigger_path)
                     except OSError:
                         pass
-                if "alphabet-tracing" in by_kind:
-                    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
-                        json.dump({
-                            "domainId": "kids-printable-pdf",
-                            "product": {"productType": "alphabet_tracing", "title": "Alphabet Tracing Workbook"}
-                        }, f)
-                        alphabet_trigger = f.name
-                    try:
-                        alphabet_out = resolve_context_prepend(desc, "worker-content", ROOT, alphabet_trigger)
-                        check("alphabet-tracing-workbook" in alphabet_out,
-                              f"{name}: alphabet-tracing context injects alphabet skill")
-                    finally:
-                        try:
-                            os.unlink(alphabet_trigger)
-                        except OSError:
-                            pass
 
     # 2. interactive resolve -- only meaningful if descriptor declares an interactive block
     if desc.get("interactive"):

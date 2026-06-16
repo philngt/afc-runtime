@@ -16,7 +16,7 @@ from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, load_workspace
 
 # Force LF newlines on Windows -- bash `read` consumers see a trailing CR
 # otherwise, which contaminates the last token of each emitted line (e.g.
-# `worker-listing\r` would fail supervisor's role-known check).
+# `worker-x\r` would fail supervisor's role-known check).
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(newline="\n")
 

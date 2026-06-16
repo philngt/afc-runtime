@@ -83,7 +83,7 @@ def infer_product_kind(context: dict[str, Any] | None = None) -> str:
     except Exception:
         context = context or {}
         explicit = str(context.get("productKind") or context.get("productType") or context.get("kind") or "")
-        return explicit.casefold().replace("_", "-") or "generic-printable"
+        return explicit.casefold().replace("_", "-") or "generic"
 
 
 def _product_kind_files(ctx: dict[str, Any], role: str, product_kind: str) -> list[str]:

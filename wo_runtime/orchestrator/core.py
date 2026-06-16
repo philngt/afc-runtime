@@ -211,8 +211,14 @@ class Orchestrator:
             if not base_time:
                 continue
             timeout = default_timeout if heartbeat is not None else no_heartbeat_timeout
-            if task.get("capability") == "media-batch":
-                timeout = int(os.environ.get("ORCH_MEDIA_STALE_SECONDS", str(timeout)))
+            hook_timeout = self.hooks.call(
+                "claimed_task_timeout_seconds",
+                task,
+                has_heartbeat=heartbeat is not None,
+                default=None,
+            )
+            if hook_timeout is not None:
+                timeout = int(hook_timeout)
             age = (now() - base_time).total_seconds()
             if age < timeout:
                 continue
