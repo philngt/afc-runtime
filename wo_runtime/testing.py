@@ -12,6 +12,64 @@ def run_synthetic_selftest() -> int:
     cli = Path(__file__).resolve().parents[1] / "bin" / "wo-runtime"
     with tempfile.TemporaryDirectory(prefix="wo-runtime-selftest-") as raw:
         root = Path(raw)
+        (root / "runtime").mkdir(parents=True, exist_ok=True)
+        (root / "runtime" / "workspace.json").write_text(
+            json.dumps(
+                {
+                    "workspaceRoot": ".",
+                    "defaultDataRoot": ".run/data",
+                    "domainsDir": "domains",
+                    "pipelinesDir": "pipelines",
+                    "contractsDir": "contracts",
+                    "defaultDomainId": "demo",
+                    "defaultPipelineId": "demo-linear",
+                    "fanoutDefaults": {"locale": ["en-US"]},
+                    "contextContracts": {"base": ["task.schema.json", "result.schema.json"]},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (root / "domains" / "demo").mkdir(parents=True, exist_ok=True)
+        (root / "domains" / "demo" / "domain.json").write_text(
+            json.dumps(
+                {
+                    "id": "demo",
+                    "defaultPipelineId": "demo-linear",
+                    "defaultLocales": ["en-US"],
+                    "resources": {},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (root / "pipelines").mkdir(parents=True, exist_ok=True)
+        (root / "pipelines" / "demo-linear.json").write_text(
+            json.dumps(
+                {
+                    "id": "demo-linear",
+                    "stages": [
+                        {"number": "T1", "capability": "first", "stage": "first_pass", "inputAs": "first"},
+                        {
+                            "number": "T2",
+                            "capability": "second",
+                            "stage": "second_pass",
+                            "dependsOn": ["T1"],
+                            "fanout": ["locale"],
+                            "isRoot": True,
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         data = root / ".run" / "data"
         ready = data / "tasks" / "ready-wk"
         ready.mkdir(parents=True)
@@ -178,6 +236,36 @@ def run_synthetic_selftest() -> int:
             return 1
         stale_task = json.loads(stale.read_text(encoding="utf-8"))
         if not check(stale_task.get("attempt") == 1, "orchestrator increments stale attempt"):
+            return 1
+
+        # Core planner/context CLI.
+        for child in (data / "tasks").glob("*"):
+            if child.is_dir():
+                for item in child.glob("*.json"):
+                    item.unlink()
+        for item in (data / "results").glob("*.json"):
+            item.unlink()
+        request_path = root / "request.json"
+        request_path.write_text('{"id":"REQ","kind":"product","title":"Demo","locales":["en-US"]}\n', encoding="utf-8")
+        dry_run = run("core", "plan", "--request-file", str(request_path), "--dry-run")
+        if dry_run.returncode != 0 or '"id": "REQ.T2.en-US"' not in dry_run.stdout:
+            print(dry_run.stderr or dry_run.stdout, file=sys.stderr)
+            return 1
+        write_plan = run("core", "plan", "--request-file", str(request_path), "--write")
+        if write_plan.returncode != 0:
+            print(write_plan.stderr or write_plan.stdout, file=sys.stderr)
+            return 1
+        if not check((data / "tasks" / "pending" / "REQ.T1.json").exists(), "core planner writes first task"):
+            return 1
+        if not check((data / "tasks" / "pending" / "REQ.T2.en-US.json").exists(), "core planner writes fanout root task"):
+            return 1
+        validate = run("core", "validate-dag", "--req-id", "REQ")
+        if validate.returncode != 0:
+            print(validate.stderr or validate.stdout, file=sys.stderr)
+            return 1
+        context = run("core", "context", "REQ.T2.en-US")
+        if context.returncode != 0 or '"artifact_type": "task_context"' not in context.stdout:
+            print(context.stderr or context.stdout, file=sys.stderr)
             return 1
 
     print("[wo-runtime selftest] OK")

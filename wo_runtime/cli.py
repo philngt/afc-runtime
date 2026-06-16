@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from wo_runtime.core import commands as core_commands
 from wo_runtime.orchestrator import core as orchestrator_core
 from wo_runtime.queue import commands as queue_commands
 from wo_runtime.runtime import fleet_plan, resolve, selftest as runtime_selftest, start, supervisor
@@ -90,6 +91,10 @@ def _dispatch_orchestrator(argv: list[str]) -> int:
     return 2
 
 
+def _dispatch_core(argv: list[str]) -> int:
+    return core_commands.main(argv)
+
+
 def build_parser() -> argparse.ArgumentParser:
     workspace = _workspace_parent()
     parser = argparse.ArgumentParser(prog="wo-runtime")
@@ -112,6 +117,9 @@ def build_parser() -> argparse.ArgumentParser:
         child = orchestrator_sub.add_parser(name, parents=[workspace])
         child.set_defaults(func=_not_implemented(f"orchestrator {name}"))
 
+    core = subparsers.add_parser("core", help="Reusable core planner/context commands")
+    core.set_defaults(func=_not_implemented("core"))
+
     selftest = subparsers.add_parser("selftest", parents=[workspace], help="Run runtime synthetic selftests")
     selftest.add_argument("--synthetic-workspace", action="store_true")
     selftest.set_defaults(func=lambda _args: run_synthetic_selftest())
@@ -132,6 +140,8 @@ def main(argv: list[str] | None = None) -> int:
         return _dispatch_runtime(argv[1:])
     if argv[:1] == ["orchestrator"]:
         return _dispatch_orchestrator(argv[1:])
+    if argv[:1] == ["core"]:
+        return _dispatch_core(argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     func = getattr(args, "func", None)
