@@ -1,0 +1,75 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Audit Report",
+  "description": "Deterministic workflow audit report for a task, request, or runtime state.",
+  "type": "object",
+  "required": [
+    "artifact_type",
+    "status",
+    "checks",
+    "blockingIssues"
+  ],
+  "properties": {
+    "artifact_type": {
+      "const": "audit_report"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "reqId": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pass", "warn", "fail"]
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "status", "message"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pass", "warn", "fail"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "blockingIssues": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "suggestedFailureCode": {
+      "type": "string"
+    },
+    "affectedRefs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "affectedPromptRefs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "recommendedResetBoundary": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

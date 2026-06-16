@@ -1,0 +1,120 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Task Context",
+  "description": "Compact, deterministic context pack for a single queued task.",
+  "type": "object",
+  "required": [
+    "artifact_type",
+    "taskId",
+    "reqId",
+    "capability",
+    "stage",
+    "task",
+    "product",
+    "resolvedInputs",
+    "domain",
+    "pipeline",
+    "productKind",
+    "contracts",
+    "guidanceRefs",
+    "requiredAudits",
+    "canonicalArtifacts",
+    "stateWarnings"
+  ],
+  "properties": {
+    "artifact_type": {
+      "const": "task_context"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "reqId": {
+      "type": "string"
+    },
+    "capability": {
+      "type": "string"
+    },
+    "stage": {
+      "type": "string"
+    },
+    "task": {
+      "type": "object"
+    },
+    "product": {
+      "type": "object"
+    },
+    "resolvedInputs": {
+      "type": "object"
+    },
+    "domain": {
+      "type": "object",
+      "required": ["id", "profileRef"],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "profileRef": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "pipeline": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "profileRef": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "productKind": {
+      "type": "object"
+    },
+    "contracts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "ref"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "guidanceRefs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "requiredAudits": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "canonicalArtifacts": {
+      "type": "object"
+    },
+    "stateWarnings": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "additionalProperties": true
+}

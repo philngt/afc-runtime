@@ -1,0 +1,155 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Recovery Ticket",
+  "description": "Generic DAG-step recovery ticket. Domain roles may provide evidence, but the engine applies only deterministic reset policy.",
+  "type": "object",
+  "required": [
+    "id",
+    "req_id",
+    "status",
+    "detectedByTaskId",
+    "reason",
+    "repairMode",
+    "attemptCount",
+    "maxAttempts"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "req_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "open",
+        "dry_run",
+        "auto_reset",
+        "applied",
+        "blocked",
+        "blocked_after_reset",
+        "deferred",
+        "planner_requested",
+        "branch_planned"
+      ]
+    },
+    "kind": {
+      "type": "string"
+    },
+    "detectedByTaskId": {
+      "type": "string"
+    },
+    "rootCauseTaskId": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "evidence": {
+      "type": "string"
+    },
+    "repairMode": {
+      "type": "string",
+      "enum": [
+        "rerun",
+        "patch",
+        "regenerate_item",
+        "manual_review",
+        "repair_branch",
+        "deterministic_answer_key",
+        "prompt_patch_regenerate_item"
+      ]
+    },
+    "failureSubtype": {
+      "type": "string"
+    },
+    "rootCauseType": {
+      "type": "string"
+    },
+    "classificationSource": {
+      "type": "string",
+      "enum": [
+        "deterministic",
+        "agent",
+        "manual",
+        "legacy_hint"
+      ]
+    },
+    "affectedRefs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "invalidateScope": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "error": {
+      "type": "string"
+    },
+    "failedDependency": {
+      "type": "string"
+    },
+    "suggestedAction": {
+      "type": "string"
+    },
+    "autoSafe": {
+      "type": "boolean"
+    },
+    "attemptCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "maxAttempts": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "createdAt": {
+      "type": "string"
+    },
+    "updatedAt": {
+      "type": "string"
+    },
+    "lastSeenAt": {
+      "type": "string"
+    },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "audit": {
+      "type": "object"
+    },
+    "branchId": {
+      "type": "string"
+    },
+    "parentBranchId": {
+      "type": "string"
+    },
+    "plannerRequestRef": {
+      "type": "string"
+    },
+    "repairBranchReqId": {
+      "type": "string"
+    },
+    "reuseArtifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "replaceFromStage": {
+      "type": "string"
+    },
+    "resumeFromStage": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

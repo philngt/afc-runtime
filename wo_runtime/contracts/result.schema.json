@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Runtime Result",
+  "description": "Domain-neutral task result envelope written by queue workers or the orchestrator.",
+  "type": "object",
+  "required": [
+    "task_id",
+    "status"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "worker": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "success",
+        "failed"
+      ]
+    },
+    "artifact_type": {
+      "type": "string"
+    },
+    "result": {
+      "description": "Worker-defined artifact payload. Root task results become the request deliverable.",
+      "type": [
+        "object",
+        "array",
+        "string",
+        "number",
+        "boolean",
+        "null"
+      ]
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "error": {
+      "type": "string"
+    },
+    "ts": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

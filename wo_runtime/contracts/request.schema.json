@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Runtime Request",
+  "description": "Domain-neutral request envelope. Instances may add product-specific fields and stricter validation.",
+  "type": "object",
+  "required": [
+    "id"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "type": "string"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "createdAt": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Runtime Task",
+  "description": "Domain-neutral task envelope for file-queue orchestration. Worker payload fields are instance-defined.",
+  "type": "object",
+  "required": [
+    "id",
+    "req_id",
+    "capability",
+    "depends_on"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "req_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "capability": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stage": {
+      "type": "string"
+    },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "is_root": {
+      "type": "boolean",
+      "default": false
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
