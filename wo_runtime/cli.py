@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from wo_runtime.orchestrator import core as orchestrator_core
 from wo_runtime.queue import commands as queue_commands
 from wo_runtime.runtime import fleet_plan, resolve, selftest as runtime_selftest, start, supervisor
 from wo_runtime.testing import run_synthetic_selftest
@@ -76,6 +77,19 @@ def _dispatch_runtime(argv: list[str]) -> int:
     return 2
 
 
+def _dispatch_orchestrator(argv: list[str]) -> int:
+    if not argv:
+        print("usage: wo-runtime orchestrator {tick,daemon} ...", file=sys.stderr)
+        return 2
+    command, rest = argv[0], argv[1:]
+    if command == "tick":
+        return orchestrator_core.tick_main(rest)
+    if command == "daemon":
+        return orchestrator_core.daemon_main(rest)
+    print(f"wo-runtime: unknown orchestrator command '{command}'", file=sys.stderr)
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     workspace = _workspace_parent()
     parser = argparse.ArgumentParser(prog="wo-runtime")
@@ -116,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["runtime"]:
         return _dispatch_runtime(argv[1:])
+    if argv[:1] == ["orchestrator"]:
+        return _dispatch_orchestrator(argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     func = getattr(args, "func", None)
