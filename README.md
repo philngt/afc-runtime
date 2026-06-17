@@ -26,3 +26,8 @@ The core layer reads instance data from `runtime/workspace.json`, `domains/`,
 `pipelines/`, and `contracts/contract-index.json`. It must not contain product
 family literals; pipeline selection, fanout defaults, input aliases, and context
 contract/audit policy are instance data.
+
+Documentation:
+
+- `docs/CORE.md` - core planner/context command contract and required instance data.
+- `wo_runtime/contracts/README.md` - runtime-neutral queue/result/context contracts.
