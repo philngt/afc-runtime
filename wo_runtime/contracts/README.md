@@ -15,6 +15,8 @@ V1 ownership:
 
 - `request.schema.json`, `task.schema.json`, and `result.schema.json` define the
   domain-neutral queue envelope.
+- `asset-manifest.schema.json` defines a reusable generated-asset inventory for
+  image, audio, video, book, and package workflows.
 - `recovery.schema.json`, `task-context.schema.json`, and
   `audit-report.schema.json` are shared workflow artifacts that avoid concrete
   product/channel enums.

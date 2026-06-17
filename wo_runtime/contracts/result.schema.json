@@ -43,6 +43,9 @@
         "additionalProperties": true
       }
     },
+    "assetManifest": {
+      "$ref": "asset-manifest.schema.json"
+    },
     "recovery": {
       "type": "object",
       "additionalProperties": true
