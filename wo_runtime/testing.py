@@ -238,6 +238,52 @@ def run_synthetic_selftest() -> int:
         if not check(stale_task.get("attempt") == 1, "orchestrator increments stale attempt"):
             return 1
 
+        (data / "tasks" / "claimed" / "H.t1.json").write_text(
+            '{"id":"H.t1","req_id":"H","capability":"wk","depends_on":[]}\n',
+            encoding="utf-8",
+        )
+        os.utime(data / "tasks" / "claimed" / "H.t1.json", (946684800, 946684800))
+        (data / "heartbeats").mkdir(parents=True, exist_ok=True)
+        (data / "heartbeats" / "H.t1.json").write_text(
+            json.dumps({
+                "task_id": "H.t1",
+                "runtime": "selftest",
+                "role": "wk",
+                "dataRoot": str(data),
+                "updatedAt": "2999-01-01T00:00:00Z",
+            }),
+            encoding="utf-8",
+        )
+        tick = run("orchestrator", "tick", env={"ORCH_NO_HEARTBEAT_SECONDS": "1"})
+        if tick.returncode != 0:
+            print(tick.stderr or tick.stdout, file=sys.stderr)
+            return 1
+        if not check((data / "tasks" / "claimed" / "H.t1.json").exists(), "orchestrator keeps heartbeating claimed task"):
+            return 1
+
+        (data / "tasks" / "claimed" / "L.t1.json").write_text(
+            '{"id":"L.t1","req_id":"L","capability":"wk","depends_on":[]}\n',
+            encoding="utf-8",
+        )
+        os.utime(data / "tasks" / "claimed" / "L.t1.json", (946684800, 946684800))
+        legacy_hb = root / ".run" / "heartbeats"
+        legacy_hb.mkdir(parents=True, exist_ok=True)
+        (legacy_hb / "L.t1.json").write_text(
+            json.dumps({
+                "task_id": "L.t1",
+                "runtime": "legacy",
+                "role": "wk",
+                "updated_at": "2999-01-01T00:00:00Z",
+            }),
+            encoding="utf-8",
+        )
+        tick = run("orchestrator", "tick", env={"ORCH_NO_HEARTBEAT_SECONDS": "1"})
+        if tick.returncode != 0:
+            print(tick.stderr or tick.stdout, file=sys.stderr)
+            return 1
+        if not check((data / "tasks" / "claimed" / "L.t1.json").exists(), "orchestrator reads legacy heartbeat path"):
+            return 1
+
         # Core planner/context CLI.
         for child in (data / "tasks").glob("*"):
             if child.is_dir():

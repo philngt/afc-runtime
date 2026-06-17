@@ -452,22 +452,27 @@ def run_startup_probe(args: argparse.Namespace, root: Path, descriptor: dict,
         )
 
 
-def heartbeat_child(root: Path, trigger: str, runtime: str, role: str,
+def heartbeat_child(root: Path, data_root: Path, trigger: str, runtime: str, role: str,
                    proc: subprocess.Popen[str]) -> None:
     interval = max(1.0, float(os.environ.get("SUPERVISOR_HEARTBEAT_SECONDS", "15")))
     task_id = Path(trigger).stem
-    hb_dir = root / ".run" / "heartbeats"
+    hb_dir = data_root / "heartbeats"
     hb_dir.mkdir(parents=True, exist_ok=True)
     hb_path = hb_dir / f"{task_id}.json"
+    started_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         while proc.poll() is None:
+            updated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             data = {
                 "task_id": task_id,
                 "trigger": trigger,
                 "runtime": runtime,
                 "role": role,
                 "pid": proc.pid,
-                "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "dataRoot": str(data_root),
+                "startedAt": started_at,
+                "updatedAt": updated_at,
+                "updated_at": updated_at,
             }
             tmp = hb_path.with_suffix(".tmp")
             try:
@@ -492,7 +497,9 @@ def supervisable(descriptor: dict, roles: dict[str, dict]) -> dict[str, dict]:
 
 def run(args: argparse.Namespace) -> int:
     root_arg = args.workspace_root or args.root
-    root = load_workspace(root_arg, args.workspace_config).root
+    workspace = load_workspace(root_arg, args.workspace_config)
+    root = workspace.root
+    data_root = workspace.data_root if workspace.data_root.is_absolute() else root / workspace.data_root
     descriptor = load_descriptor(root, args.runtime)
     descriptor["_bin"] = resolve_bin(descriptor, args.bin)
     roles = supervisable(descriptor, load_roles(root))
@@ -658,7 +665,7 @@ def run(args: argparse.Namespace) -> int:
                             log_thread.start()
                         heartbeat_thread = threading.Thread(
                             target=heartbeat_child,
-                            args=(root, trig[0], args.runtime, name, proc),
+                            args=(root, data_root, trig[0], args.runtime, name, proc),
                             daemon=True,
                         )
                         heartbeat_thread.start()

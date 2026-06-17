@@ -56,6 +56,18 @@ def file_mtime(path: Path) -> dt.datetime | None:
         return None
 
 
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 @dataclass
 class OrchestratorPaths:
     workspace_root: Path
@@ -272,16 +284,33 @@ class Orchestrator:
         task_id = str(task.get("id") or "")
         if not task_id:
             return None
-        path = self.paths.workspace_root / ".run" / "heartbeats" / f"{task_id}.json"
-        if not path.exists():
-            return None
-        try:
-            heartbeat = read_json(path)
-        except Exception:
-            return None
-        if heartbeat.get("task_id") != task_id:
-            return None
-        return parse_ts(str(heartbeat.get("updated_at") or ""))
+        candidates = [
+            self.paths.data_root / "heartbeats" / f"{task_id}.json",
+            self.paths.workspace_root / ".run" / "heartbeats" / f"{task_id}.json",
+        ]
+        seen: set[Path] = set()
+        for path in candidates:
+            if path in seen or not path.exists():
+                continue
+            seen.add(path)
+            try:
+                heartbeat = read_json(path)
+            except Exception:
+                continue
+            if heartbeat.get("task_id") != task_id:
+                continue
+            try:
+                pid = int(heartbeat.get("pid") or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            if pid and not pid_alive(pid):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            return parse_ts(str(heartbeat.get("updated_at") or heartbeat.get("updatedAt") or ""))
+        return None
 
     def recover_dep_failed_pass(self) -> None:
         backup_dir = self.paths.p("results", "_recovered")
