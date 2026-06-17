@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from wo_runtime.core.context import build_context
 from wo_runtime.workspace import Workspace, load_and_prepare
 
 
@@ -216,6 +217,24 @@ def promote(args: Any) -> int:
     if not capability:
         print(f"could not parse capability from {raw_path}", file=sys.stderr)
         return 1
+
+    try:
+        context = build_context(str(task.get("id") or path.stem), workspace=ws)
+        pack = context.get("contextPack")
+        if isinstance(pack, dict) and pack.get("status") != "disabled":
+            task["contextPack"] = pack
+            path.write_text(json.dumps(task, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
+    except Exception as exc:
+        _event(
+            data_root / "events" / "log.jsonl",
+            {
+                "event": "context_pack_warning",
+                "task": path.stem,
+                "capability": capability,
+                "error": f"{type(exc).__name__}: {exc}",
+                "ts": _ts(),
+            },
+        )
 
     ready = data_root / "tasks" / f"ready-{capability}"
     ready.mkdir(parents=True, exist_ok=True)

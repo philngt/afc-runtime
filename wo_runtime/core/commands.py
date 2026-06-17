@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from wo_runtime.core.context import build_context
+from wo_runtime.core.context_packs import compact_worker_context, inline_input_max_bytes
 from wo_runtime.core.contracts import contract_path
 from wo_runtime.core.pipeline import PlanError, compile_request, validate_tasks
 from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, Workspace, ensure_data_root, load_workspace
@@ -150,6 +151,8 @@ def cmd_plan_inbox(args: argparse.Namespace) -> int:
 def cmd_context(args: argparse.Namespace) -> int:
     workspace = _workspace(args)
     payload = build_context(args.task_id, full=args.full, workspace=workspace)
+    if args.view == "worker":
+        payload = compact_worker_context(payload, inline_max_bytes=inline_input_max_bytes(workspace))
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     if args.fail_on_warnings and payload.get("stateWarnings"):
         return 1
@@ -221,6 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
     context = sub.add_parser("context", parents=[workspace], help="Build context pack for a task")
     context.add_argument("task_id")
     context.add_argument("--full", action="store_true")
+    context.add_argument("--view", choices=["full", "worker"], default="full")
     context.add_argument("--fail-on-warnings", action="store_true")
     context.set_defaults(func=cmd_context)
 
@@ -256,4 +260,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

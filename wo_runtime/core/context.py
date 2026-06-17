@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from wo_runtime.core.contracts import contract_path
+from wo_runtime.core.context_packs import ensure_shared_context_pack, input_refs
 from wo_runtime.core.domain import (
     current_workspace,
     domain_id_from_context,
@@ -250,9 +251,10 @@ def build_context(task_id: str, *, full: bool = False, workspace: Workspace | No
         "canonicalArtifacts": canonical_artifacts(task, workspace=ws),
         "stateWarnings": warnings,
     }
+    payload["inputRefs"] = input_refs(ws, task)
+    payload["contextPack"] = ensure_shared_context_pack(ws, payload)
     if full:
         payload["domain"]["profile"] = load_domain_profile(domain_id, product_context, workspace=ws)
         if pipeline_path.exists():
             payload["pipeline"]["profile"] = read_json(pipeline_path)
     return payload
-

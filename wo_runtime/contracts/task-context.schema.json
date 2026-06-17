@@ -46,6 +46,70 @@
     "resolvedInputs": {
       "type": "object"
     },
+    "inputRefs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["as", "taskId", "resultRef", "status"],
+        "properties": {
+          "as": {
+            "type": "string"
+          },
+          "taskId": {
+            "type": "string"
+          },
+          "resultRef": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "artifact_type": {
+            "type": "string"
+          },
+          "exists": {
+            "type": "boolean"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "integer"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "contextPack": {
+      "type": "object",
+      "properties": {
+        "artifact_type": {
+          "const": "context_pack_ref"
+        },
+        "version": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "packKey": {
+          "type": "string"
+        },
+        "ref": {
+          "type": "string"
+        },
+        "compiledRef": {
+          "type": "string"
+        },
+        "sourceHash": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
     "domain": {
       "type": "object",
       "required": ["id", "profileRef"],
@@ -114,6 +178,9 @@
       "items": {
         "type": "object"
       }
+    },
+    "contextView": {
+      "type": "object"
     }
   },
   "additionalProperties": true

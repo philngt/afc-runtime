@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from wo_runtime.core.context import build_context
 from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, load_and_prepare
 
 
@@ -418,6 +419,43 @@ class Orchestrator:
             if hooked_task is None:
                 continue
             task = hooked_task
+            try:
+                workspace = load_and_prepare(self.paths.workspace_root)
+                pack_cfg = workspace.config.get("contextPacks") if isinstance(workspace.config.get("contextPacks"), dict) else {}
+                context = build_context(str(task.get("id") or task_path.stem), workspace=workspace)
+                warnings = context.get("stateWarnings") if isinstance(context.get("stateWarnings"), list) else []
+                if warnings:
+                    self.log({
+                        "event": "context_state_warning",
+                        "task": task.get("id") or task_path.stem,
+                        "capability": task.get("capability"),
+                        "warnings": warnings,
+                    })
+                    if pack_cfg.get("strictOnPromote"):
+                        first = warnings[0] if isinstance(warnings[0], dict) else {}
+                        task["blocked_status"] = "context_warning"
+                        task["blocked_reason"] = str(first.get("code") or "context_state_warning")
+                        task["blocked_at"] = ts()
+                        write_json(task_path, task)
+                        continue
+                pack = context.get("contextPack")
+                if isinstance(pack, dict) and pack.get("status") != "disabled":
+                    task["contextPack"] = pack
+            except Exception as exc:
+                self.log({
+                    "event": "context_pack_warning",
+                    "task": task.get("id") or task_path.stem,
+                    "capability": task.get("capability"),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                cfg = load_and_prepare(self.paths.workspace_root).config
+                pack_cfg = cfg.get("contextPacks") if isinstance(cfg.get("contextPacks"), dict) else {}
+                if pack_cfg.get("strictOnPromote"):
+                    task["blocked_status"] = "context_pack_failed"
+                    task["blocked_reason"] = f"{type(exc).__name__}: {exc}"
+                    task["blocked_at"] = ts()
+                    write_json(task_path, task)
+                    continue
             write_json(task_path, task)
             cap = str(task["capability"])
             ready_path = self.paths.p("tasks", f"ready-{cap}", task_path.name)

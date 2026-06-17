@@ -103,6 +103,10 @@ def test_runtime(name: str) -> None:
             out = resolve_context_prepend(desc, sample, ROOT)
             check("[CONTEXT:" in out and "[/CONTEXT:" in out,
                   f"{name}: prepend for role '{sample}' includes CONTEXT markers")
+            materialized = ctx.get("materialized") if isinstance(ctx.get("materialized"), dict) else {}
+            if materialized.get("enabled"):
+                check("[CONTEXT-PACK:" in out,
+                      f"{name}: materialized prepend includes CONTEXT-PACK marker")
             if by_kind:
                 sample_kind = next(iter(by_kind))
                 sample_spec = by_kind[sample_kind]
