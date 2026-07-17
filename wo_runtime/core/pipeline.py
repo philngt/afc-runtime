@@ -12,6 +12,14 @@ from wo_runtime.core.domain import (
     load_domain_profile,
     workspace_path,
 )
+from wo_runtime.core.validation import (
+    QUEUE_CONTRACT_VERSION,
+    QueueContractError,
+    validate_identifier,
+    validate_request_envelope,
+    validate_resource_id,
+    validate_task_envelope,
+)
 from wo_runtime.workspace import Workspace
 
 
@@ -24,7 +32,8 @@ def pipelines_dir(workspace: Workspace | None = None) -> Path:
 
 
 def pipeline_profile_path(pipeline_id: str, workspace: Workspace | None = None) -> Path:
-    return pipelines_dir(workspace) / f"{pipeline_id}.json"
+    safe_id = validate_resource_id(pipeline_id, "pipelineId")
+    return pipelines_dir(workspace) / f"{safe_id}.json"
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -118,13 +127,13 @@ def resolve_domain_and_pipeline(
     workspace: Workspace,
     request: dict[str, Any],
 ) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
-    domain_id = domain_id_from_context(request, workspace=workspace)
+    domain_id = validate_resource_id(domain_id_from_context(request, workspace=workspace), "domainId")
     domain = load_domain_profile(domain_id, request, workspace=workspace, must_exist=False)
-    pipeline_id = select_pipeline_id(workspace, request, domain)
+    pipeline_id = validate_resource_id(select_pipeline_id(workspace, request, domain), "pipelineId")
     pipeline = load_pipeline(pipeline_id, workspace=workspace)
     defaults = pipeline.get("defaults") if isinstance(pipeline.get("defaults"), dict) else {}
     if not _has_explicit_domain(request) and defaults.get("domainId"):
-        domain_id = str(defaults["domainId"])
+        domain_id = validate_resource_id(defaults["domainId"], "pipeline.defaults.domainId")
         domain = load_domain_profile(domain_id, request, workspace=workspace, must_exist=False)
     return domain_id, domain, pipeline_id, pipeline
 
@@ -373,6 +382,7 @@ def _task_base(
     axes: dict[str, str],
 ) -> dict[str, Any]:
     task: dict[str, Any] = {
+        "queue_contract": QUEUE_CONTRACT_VERSION,
         "id": task_id,
         "req_id": request_id,
         "capability": str(stage.get("capability") or ""),
@@ -397,11 +407,11 @@ def _task_base(
 
 
 def compile_request(workspace: Workspace, request: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(request, dict):
-        raise PlanError("request_invalid:not_object")
-    request_id = str(request.get("id") or request.get("req_id") or "").strip()
-    if not request_id:
-        raise PlanError("request_invalid:missing_id")
+    try:
+        validate_request_envelope(request)
+        request_id = validate_identifier(request.get("id") or request.get("req_id"), "request.id")
+    except QueueContractError as exc:
+        raise PlanError(f"request_invalid:{exc}") from exc
     domain_id, domain, pipeline_id, pipeline = resolve_domain_and_pipeline(workspace, request)
     product = _apply_defaults(
         request,
@@ -494,6 +504,11 @@ def compile_request(workspace: Workspace, request: dict[str, Any]) -> dict[str, 
 
 
 def validate_tasks(tasks: list[dict[str, Any]]) -> None:
+    for task in tasks:
+        try:
+            validate_task_envelope(task, require_stage=True)
+        except QueueContractError as exc:
+            raise PlanError(f"dag_invalid:{exc}") from exc
     ids = [str(task.get("id") or "") for task in tasks]
     id_set = set(ids)
     if len(id_set) != len(ids):

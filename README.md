@@ -30,4 +30,5 @@ contract/audit policy are instance data.
 Documentation:
 
 - `docs/CORE.md` - core planner/context command contract and required instance data.
+- `docs/QUEUE.md` - safe paths, targeted leases, terminal idempotency, deadlines, and instance hooks.
 - `wo_runtime/contracts/README.md` - runtime-neutral queue/result/context contracts.

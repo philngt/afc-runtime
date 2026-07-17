@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from wo_runtime.workspace import Workspace, load_workspace
+from wo_runtime.core.validation import validate_resource_id
 
 
 def current_workspace(workspace: Workspace | None = None) -> Workspace:
@@ -49,14 +50,15 @@ def domains_dir(workspace: Workspace | None = None) -> Path:
 
 
 def domain_dir(domain_id: str, workspace: Workspace | None = None) -> Path:
-    return domains_dir(workspace) / domain_id
+    return domains_dir(workspace) / validate_resource_id(domain_id, "domainId")
 
 
 def domain_profile_path(domain_id: str, workspace: Workspace | None = None) -> Path:
-    packaged = domain_dir(domain_id, workspace) / "domain.json"
+    safe_id = validate_resource_id(domain_id, "domainId")
+    packaged = domain_dir(safe_id, workspace) / "domain.json"
     if packaged.exists():
         return packaged
-    return domains_dir(workspace) / f"{domain_id}.json"
+    return domains_dir(workspace) / f"{safe_id}.json"
 
 
 def load_domain_profile(
@@ -150,4 +152,3 @@ def load_domain_resource_json(
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
-

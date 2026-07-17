@@ -7,20 +7,27 @@
     "id",
     "req_id",
     "capability",
-    "depends_on"
+    "depends_on",
+    "queue_contract"
   ],
   "properties": {
     "id": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@+~-]*$"
     },
     "req_id": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@+~-]*$"
     },
     "capability": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
     },
     "stage": {
       "type": "string"
@@ -28,7 +35,10 @@
     "depends_on": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 240,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@+~-]*$"
       },
       "default": []
     },
@@ -43,9 +53,61 @@
       "type": "boolean",
       "default": false
     },
+    "manualOnly": {
+      "type": "boolean",
+      "default": false,
+      "description": "When true, generic/model worker claim commands must not reserve this task."
+    },
     "attempt": {
       "type": "integer",
       "minimum": 0
+    },
+    "queue_contract": {
+      "type": "string",
+      "enum": [
+        "queue.v2"
+      ]
+    },
+    "claim": {
+      "type": "object",
+      "required": [
+        "lease_id",
+        "worker",
+        "attempt",
+        "claimed_at",
+        "lease_expires_at",
+        "capability"
+      ],
+      "properties": {
+        "lease_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@+~-]*$"
+        },
+        "worker": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "claimed_at": {
+          "type": "string"
+        },
+        "lease_expires_at": {
+          "type": "string"
+        },
+        "capability": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        }
+      },
+      "additionalProperties": true
     },
     "lineage": {
       "type": "object",
