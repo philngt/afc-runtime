@@ -9,11 +9,23 @@ import os
 import shutil
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from wo_runtime.core.context import build_context
+from wo_runtime.core.validation import (
+    QUEUE_CONTRACT_VERSION,
+    QueueContractError,
+    result_digest,
+    safe_file,
+    validate_claim_binding,
+    validate_identifier,
+    validate_task_envelope,
+    validate_terminal_result_binding,
+)
+from wo_runtime.queue.locking import QueueBusyError, task_lock
 from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, load_and_prepare
 
 
@@ -45,27 +57,25 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False)
-
-
-def file_mtime(path: Path) -> dt.datetime | None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        return dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
-    except Exception:
-        return None
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
-def pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+def validate_task_path(path: Path, task: dict[str, Any]) -> str:
+    """Validate the envelope and its binding to the queue filename."""
+    validate_task_envelope(task)
+    task_id = validate_identifier(task.get("id"), "task.id")
+    if path.name != f"{task_id}.json":
+        raise QueueContractError(f"task.filename_mismatch:{path.name}:{task_id}")
+    return task_id
 
 
 @dataclass
@@ -130,6 +140,25 @@ class Orchestrator:
         self.hooks.call("after_task_invalid", self.rel(path), reason, default=None)
         print(f"[orch] quarantined {self.rel(path)}: {reason}", file=sys.stderr)
 
+    def quarantine_result(self, path: Path, task_id: str, reason: str) -> None:
+        invalid_dir = self.paths.p("results", "_invalid")
+        invalid_dir.mkdir(parents=True, exist_ok=True)
+        target = invalid_dir / (
+            f"{path.stem}.{now().strftime('%Y%m%dT%H%M%SZ')}.{uuid.uuid4().hex[:8]}.json"
+        )
+        try:
+            shutil.move(str(path), str(target))
+        except FileNotFoundError:
+            return
+        self.log({
+            "event": "terminal_result_rejected",
+            "task": task_id,
+            "reason": reason,
+            "from": self.rel(path),
+            "to": self.rel(target),
+        })
+        print(f"[orch] rejected terminal result for {task_id}: {reason}", file=sys.stderr)
+
     def rel(self, path: Path) -> str:
         try:
             return path.relative_to(self.paths.data_root).as_posix()
@@ -141,176 +170,160 @@ class Orchestrator:
         ready = [path for path in sorted(self.paths.p("tasks").glob("ready-*")) if path.is_dir()]
         return fixed + ready
 
-    def latest_claims(self) -> dict[str, dict[str, Any]]:
-        claims: dict[str, dict[str, Any]] = {}
-        log_path = self.paths.p("events", "log.jsonl")
-        if not log_path.exists():
-            return claims
-        for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            try:
-                event = json.loads(line)
-            except Exception:
-                continue
-            if isinstance(event, dict) and event.get("event") == "claim" and event.get("task"):
-                claims[str(event["task"])] = event
-        return claims
-
     def reconcile_claimed_results_pass(self) -> None:
         claimed_dir = self.paths.p("tasks", "claimed")
-        done_dir = self.paths.p("tasks", "done")
-        results_dir = self.paths.p("results")
-        archive_dir = self.paths.p("tasks", "_stale", "claimed-results", now().strftime("%Y%m%dT%H%M%SZ"))
         for claimed_path in sorted(claimed_dir.glob("*.json")) if claimed_dir.exists() else []:
             try:
                 task = read_json(claimed_path)
-            except Exception:
-                continue
-            task_id = str(task.get("id") or claimed_path.stem)
-            result_path = results_dir / f"{task_id}.json"
-            if not result_path.exists():
+                task_id = validate_task_path(claimed_path, task)
+            except Exception as exc:
+                self.quarantine(claimed_path, f"task_contract_error:{exc}")
                 continue
             try:
-                result = read_json(result_path)
-            except Exception:
+                with task_lock(self.paths.data_root, task_id, purpose="reconcile"):
+                    if not claimed_path.exists():
+                        continue
+                    self._reconcile_claimed_path(claimed_path, task_id)
+            except (QueueBusyError, OSError, ValueError):
                 continue
-            if result.get("task_id") not in {None, task_id}:
-                continue
-            if result.get("status") not in {"success", "failed"}:
-                continue
-            done_path = done_dir / claimed_path.name
-            if done_path.exists():
-                archive_dir.mkdir(parents=True, exist_ok=True)
-                target = archive_dir / claimed_path.name
-                shutil.move(str(claimed_path), str(target))
-                self.log({
-                    "event": "claimed_result_duplicate_archived",
-                    "task": task_id,
-                    "status": result.get("status"),
-                    "from": self.rel(claimed_path),
-                    "to": self.rel(target),
-                })
-                continue
-            done_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(claimed_path), str(done_path))
+
+    def _reconcile_claimed_path(self, claimed_path: Path, task_id: str) -> None:
+        done_dir = self.paths.p("tasks", "done")
+        result_path = safe_file(self.paths.p("results"), task_id, field="task.id")
+        if not result_path.exists():
+            return
+        try:
+            task = read_json(claimed_path)
+            validate_task_path(claimed_path, task)
+            result = read_json(result_path)
+            validate_terminal_result_binding(task, result, expected_task_id=task_id)
+        except Exception as exc:
+            self.quarantine_result(result_path, task_id, f"{type(exc).__name__}:{exc}")
+            return
+        done_path = safe_file(done_dir, task_id, field="task.id")
+        if done_path.exists():
+            archive_dir = self.paths.p("tasks", "_stale", "claimed-results", now().strftime("%Y%m%dT%H%M%SZ"))
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            target = archive_dir / claimed_path.name
+            shutil.move(str(claimed_path), str(target))
             self.log({
-                "event": "claimed_result_reconciled",
+                "event": "claimed_result_duplicate_archived",
                 "task": task_id,
                 "status": result.get("status"),
                 "from": self.rel(claimed_path),
-                "to": self.rel(done_path),
+                "to": self.rel(target),
             })
+            return
+        done_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(claimed_path), str(done_path))
+        self.log({
+            "event": "claimed_result_reconciled",
+            "task": task_id,
+            "status": result.get("status"),
+            "from": self.rel(claimed_path),
+            "to": self.rel(done_path),
+        })
+
+    def _handle_claim_timeout(
+        self,
+        claimed_path: Path,
+        task: dict[str, Any],
+        *,
+        age: float,
+        max_attempts: int,
+    ) -> None:
+        task_id = str(task.get("id") or claimed_path.stem)
+        try:
+            lock = task_lock(self.paths.data_root, task_id, purpose="watchdog-timeout")
+            with lock:
+                if not claimed_path.exists():
+                    return
+                current = read_json(claimed_path)
+                validate_task_path(claimed_path, current)
+                result_path = self.paths.p("results", f"{task_id}.json")
+                if result_path.exists():
+                    return
+
+                action = self.hooks.call(
+                    "before_claim_timeout",
+                    current,
+                    claimed_path,
+                    age_seconds=age,
+                    max_attempts=max_attempts,
+                    default=None,
+                )
+                if action == "handled":
+                    return
+
+                attempt = int(current.get("attempt", 0)) + 1
+                claim = current.get("claim") if isinstance(current.get("claim"), dict) else {}
+                if attempt > max_attempts:
+                    terminal = {
+                        "queue_contract": QUEUE_CONTRACT_VERSION,
+                        "task_id": task_id,
+                        "worker": str(claim.get("worker") or ""),
+                        "status": "failed",
+                        "result": None,
+                        "error": f"claim_timeout:max_attempts:{max_attempts}",
+                        "lease_id": str(claim.get("lease_id") or ""),
+                        "attempt": int(claim.get("attempt", current.get("attempt", 0)) or 0),
+                        "ts": ts(),
+                    }
+                    terminal["result_digest"] = result_digest(terminal)
+                    validate_terminal_result_binding(current, terminal, expected_task_id=task_id)
+                    write_json(result_path, terminal)
+                    done_path = self.paths.p("tasks", "done", claimed_path.name)
+                    done_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(claimed_path), str(done_path))
+                    self.log({"event": "claim_timeout_failed", "task": task_id, "attempt": attempt})
+                    self.hooks.call("after_claim_timeout_failed", task_id, max_attempts, default=None)
+                    return
+                cap = str(current.get("capability") or "")
+                current["attempt"] = attempt
+                current["queue_contract"] = QUEUE_CONTRACT_VERSION
+                current.pop("claim", None)
+                write_json(claimed_path, current)
+                ready_path = self.paths.p("tasks", f"ready-{cap}", claimed_path.name)
+                ready_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(claimed_path), str(ready_path))
+                self.log({
+                    "event": "claim_timeout_requeued",
+                    "task": task_id,
+                    "capability": cap,
+                    "attempt": attempt,
+                    "age_seconds": int(age),
+                })
+        except QueueBusyError:
+            return
 
     def watchdog_pass(self) -> None:
-        claims = self.latest_claims()
-        default_timeout = int(os.environ.get("ORCH_CLAIM_TIMEOUT_SECONDS", "1800"))
-        no_heartbeat_timeout = int(os.environ.get("ORCH_NO_HEARTBEAT_SECONDS", "600"))
         max_attempts = int(os.environ.get("ORCH_MAX_ATTEMPTS", "3"))
         claimed_dir = self.paths.p("tasks", "claimed")
         for claimed_path in sorted(claimed_dir.glob("*.json")) if claimed_dir.exists() else []:
             try:
                 task = read_json(claimed_path)
-            except Exception:
-                continue
-            task_id = str(task.get("id") or claimed_path.stem)
-            claim_event = claims.get(task_id, {})
-            claim_time = parse_ts(str(claim_event.get("ts") or ""))
-            claimed_file_time = file_mtime(claimed_path)
-            if claimed_file_time and (claim_time is None or claim_time < claimed_file_time):
-                claim_time = claimed_file_time
-            heartbeat = self.hooks.call("claimed_task_heartbeat_time", task, default=None)
-            if not isinstance(heartbeat, dt.datetime):
-                heartbeat = self.heartbeat_updated_at(task)
-            base_time = heartbeat or claim_time
-            if not base_time:
-                continue
-            timeout = default_timeout if heartbeat is not None else no_heartbeat_timeout
-            hook_timeout = self.hooks.call(
-                "claimed_task_timeout_seconds",
-                task,
-                has_heartbeat=heartbeat is not None,
-                default=None,
-            )
-            if hook_timeout is not None:
-                timeout = int(hook_timeout)
-            age = (now() - base_time).total_seconds()
-            if age < timeout:
-                continue
-
-            action = self.hooks.call(
-                "before_claim_timeout",
-                task,
-                claimed_path,
-                age_seconds=age,
-                max_attempts=max_attempts,
-                default=None,
-            )
-            if action == "handled":
-                continue
-
-            attempt = int(task.get("attempt", 0)) + 1
-            if attempt > max_attempts:
-                result_path = self.paths.p("results", f"{task_id}.json")
-                write_json(result_path, {
-                    "task_id": task_id,
-                    "worker": "orchestrator",
-                    "status": "failed",
-                    "result": None,
-                    "error": f"claim_timeout:max_attempts:{max_attempts}",
-                    "ts": ts(),
-                })
-                done_path = self.paths.p("tasks", "done", claimed_path.name)
-                done_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(claimed_path), str(done_path))
-                self.log({"event": "claim_timeout_failed", "task": task_id, "attempt": attempt})
-                self.hooks.call("after_claim_timeout_failed", task_id, max_attempts, default=None)
-                continue
-            cap = str(task.get("capability") or "")
-            if not cap:
-                continue
-            task["attempt"] = attempt
-            write_json(claimed_path, task)
-            ready_path = self.paths.p("tasks", f"ready-{cap}", claimed_path.name)
-            ready_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(claimed_path), str(ready_path))
-            self.log({
-                "event": "claim_timeout_requeued",
-                "task": task_id,
-                "capability": cap,
-                "attempt": attempt,
-                "age_seconds": int(age),
-            })
-
-    def heartbeat_updated_at(self, task: dict[str, Any]) -> dt.datetime | None:
-        task_id = str(task.get("id") or "")
-        if not task_id:
-            return None
-        candidates = [
-            self.paths.data_root / "heartbeats" / f"{task_id}.json",
-            self.paths.workspace_root / ".run" / "heartbeats" / f"{task_id}.json",
-        ]
-        seen: set[Path] = set()
-        for path in candidates:
-            if path in seen or not path.exists():
-                continue
-            seen.add(path)
-            try:
-                heartbeat = read_json(path)
-            except Exception:
-                continue
-            if heartbeat.get("task_id") != task_id:
+                task_id = validate_task_path(claimed_path, task)
+            except Exception as exc:
+                self.quarantine(claimed_path, f"task_contract_error:{exc}")
                 continue
             try:
-                pid = int(heartbeat.get("pid") or 0)
-            except (TypeError, ValueError):
-                pid = 0
-            if pid and not pid_alive(pid):
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
+                claim_meta = validate_claim_binding(task, expected_task_id=task_id)
+            except QueueContractError as exc:
+                self.quarantine(claimed_path, f"claim_contract_error:{exc}")
                 continue
-            return parse_ts(str(heartbeat.get("updated_at") or heartbeat.get("updatedAt") or ""))
-        return None
+            claim_time = parse_ts(str(claim_meta.get("claimed_at") or ""))
+            raw_lease_expiry = str(claim_meta.get("lease_expires_at") or "")
+            lease_expiry = parse_ts(raw_lease_expiry)
+            if claim_time is None or lease_expiry is None:
+                self.quarantine(claimed_path, "claim_contract_error:invalid_lease_expires_at")
+                continue
+            if now() < lease_expiry:
+                continue
+            age = (now() - claim_time).total_seconds()
+            try:
+                self._handle_claim_timeout(claimed_path, task, age=age, max_attempts=max_attempts)
+            except (QueueContractError, ValueError) as exc:
+                self.quarantine(claimed_path, f"claim_contract_error:{exc}")
 
     def recover_dep_failed_pass(self) -> None:
         backup_dir = self.paths.p("results", "_recovered")
@@ -324,8 +337,15 @@ class Orchestrator:
             error = str(result.get("error") or "")
             if not error.startswith("dep_failed:"):
                 continue
-            dep = error.split(":", 1)[1]
-            dep_path = self.paths.p("results", f"{dep}.json")
+            try:
+                dep = validate_identifier(error.split(":", 1)[1], "dependency.id")
+                task_id = validate_identifier(result.get("task_id") or result_path.stem, "task.id")
+                expected_result_path = safe_file(self.paths.p("results"), task_id, field="task.id")
+            except QueueContractError:
+                continue
+            if result_path.resolve() != expected_result_path:
+                continue
+            dep_path = safe_file(self.paths.p("results"), dep, field="dependency.id")
             if not dep_path.exists():
                 continue
             try:
@@ -334,18 +354,19 @@ class Orchestrator:
                 continue
             if dep_result.get("status") != "success":
                 continue
-            task_id = str(result.get("task_id") or result_path.stem)
-            task_path = self.paths.p("tasks", "done", f"{task_id}.json")
+            task_path = safe_file(self.paths.p("tasks", "done"), task_id, field="task.id")
             if not task_path.exists():
                 continue
             backup_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(result_path), str(backup_dir / f"{result_path.stem}.{ts()}.json"))
-            pending_path = self.paths.p("tasks", "pending", task_path.name)
+            stamp = now().strftime("%Y%m%dT%H%M%SZ")
+            shutil.move(str(result_path), str(backup_dir / f"{result_path.stem}.{stamp}.json"))
+            pending_path = safe_file(self.paths.p("tasks", "pending"), task_id, field="task.id")
             pending_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(task_path), str(pending_path))
-            final_path = self.paths.p("results", f"{task_id.split('.')[0]}.final.json")
+            req_id = validate_identifier(task_id.split(".", 1)[0], "request.id")
+            final_path = safe_file(self.paths.p("results"), req_id, suffix=".final.json", field="request.id")
             if final_path.exists():
-                shutil.move(str(final_path), str(backup_dir / f"{final_path.stem}.{ts()}.json"))
+                shutil.move(str(final_path), str(backup_dir / f"{final_path.stem}.{stamp}.json"))
             self.log({"event": "dep_fail_recovered", "task": task_id, "dep": dep})
 
     def promotion_pass(self) -> None:
@@ -354,8 +375,9 @@ class Orchestrator:
         for task_path in sorted(pending_dir.glob("*.json")) if pending_dir.exists() else []:
             try:
                 task = read_json(task_path)
+                validate_task_path(task_path, task)
             except Exception as exc:
-                self.quarantine(task_path, f"json_parse_error:{exc}")
+                self.quarantine(task_path, f"task_contract_error:{exc}")
                 continue
             missing = [field for field in REQUIRED_FIELDS if field not in task]
             if missing:
@@ -372,6 +394,11 @@ class Orchestrator:
             if hooked_task is None:
                 continue
             task = hooked_task
+            try:
+                validate_task_path(task_path, task)
+            except Exception as exc:
+                self.quarantine(task_path, f"task_contract_error_after_hook:{exc}")
+                continue
 
             hold_until = parse_ts(str(task.get("hold_until") or ""))
             if hold_until and hold_until > now():
@@ -386,7 +413,8 @@ class Orchestrator:
             failed_dep_result = None
             for dep in deps:
                 result_path = self.paths.p("results", f"{dep}.json")
-                if not result_path.exists():
+                done_dep_path = self.paths.p("tasks", "done", f"{dep}.json")
+                if not result_path.exists() or not done_dep_path.exists():
                     ready = False
                     break
                 try:
@@ -426,15 +454,45 @@ class Orchestrator:
                         write_json(task_path, task)
                         self.log({"event": "dep_fail_deferred", "task": task["id"], "dep": failed_dep, "reason": reason})
                     continue
+                claimed_at = ts()
+                lease_id = uuid.uuid4().hex
+                attempt = int(task.get("attempt", 0) or 0)
+                task["attempt"] = attempt
+                task["claim"] = {
+                    "lease_id": lease_id,
+                    "worker": "orchestrator",
+                    "attempt": attempt,
+                    "claimed_at": claimed_at,
+                    "lease_expires_at": (
+                        now() + dt.timedelta(minutes=5)
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "capability": task["capability"],
+                }
+                write_json(task_path, task)
+                self.log({
+                    "event": "claim",
+                    "task": task["id"],
+                    "worker": "orchestrator",
+                    "lease_id": lease_id,
+                    "attempt": attempt,
+                    "ts": claimed_at,
+                    "reason": "dependency_failure_propagation",
+                })
                 result_path = self.paths.p("results", f"{task['id']}.json")
-                write_json(result_path, {
+                terminal = {
+                    "queue_contract": QUEUE_CONTRACT_VERSION,
                     "task_id": task["id"],
                     "worker": "orchestrator",
                     "status": "failed",
                     "result": None,
                     "error": f"dep_failed:{failed_dep}",
+                    "lease_id": lease_id,
+                    "attempt": attempt,
                     "ts": ts(),
-                })
+                }
+                terminal["result_digest"] = result_digest(terminal)
+                validate_terminal_result_binding(task, terminal, expected_task_id=task["id"])
+                write_json(result_path, terminal)
                 done_path = self.paths.p("tasks", "done", task_path.name)
                 done_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(task_path), str(done_path))
@@ -448,6 +506,11 @@ class Orchestrator:
             if hooked_task is None:
                 continue
             task = hooked_task
+            try:
+                validate_task_path(task_path, task)
+            except Exception as exc:
+                self.quarantine(task_path, f"task_contract_error_after_hook:{exc}")
+                continue
             try:
                 workspace = load_and_prepare(self.paths.workspace_root)
                 pack_cfg = workspace.config.get("contextPacks") if isinstance(workspace.config.get("contextPacks"), dict) else {}
@@ -500,7 +563,9 @@ class Orchestrator:
                 path = Path(task_path)
                 try:
                     task = read_json(path)
-                except Exception:
+                    validate_task_path(path, task)
+                except Exception as exc:
+                    self.quarantine(path, f"task_contract_error:{exc}")
                     continue
                 req_id = task.get("req_id")
                 if req_id:
@@ -545,6 +610,26 @@ class Orchestrator:
                 final["error"] = root_result.get("error", "")
 
             task_list = [task for _, task in items]
+            decision = self.hooks.call(
+                "finalization_decision",
+                req_id,
+                task_list,
+                root_task,
+                root_result,
+                final,
+                default=None,
+            )
+            if isinstance(decision, str):
+                decision = {"action": decision}
+            reject_reason = ""
+            if isinstance(decision, dict):
+                action = str(decision.get("action") or "allow").casefold()
+                reason = str(decision.get("reason") or decision.get("error") or "instance_finalization_policy")
+                if action == "defer":
+                    self.log({"event": "finalization_deferred", "req_id": req_id, "reason": reason})
+                    continue
+                if action == "reject":
+                    reject_reason = reason
             final = self.hooks.call(
                 "before_final_write",
                 req_id,
@@ -556,6 +641,11 @@ class Orchestrator:
             )
             if not isinstance(final, dict):
                 raise SystemExit(f"[orchestrator] before_final_write returned non-object for {req_id}")
+            if reject_reason:
+                final["status"] = "failed"
+                final["result"] = None
+                final["error"] = reject_reason
+                final["finalizationDecision"] = "reject"
             write_json(final_path, final)
             self.log({"event": "finalized", "req_id": req_id, "status": final.get("status")})
             if final.get("status") == "success":

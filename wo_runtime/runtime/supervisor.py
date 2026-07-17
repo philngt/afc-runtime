@@ -18,8 +18,10 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -31,7 +33,20 @@ from pathlib import Path
 from typing import Any
 
 from wo_runtime.runtime.context import resolve_context_prepend
-from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, load_workspace
+from wo_runtime.queue.commands import (
+    BOUND_ATTEMPT_ENV,
+    BOUND_LEASE_ENV,
+    BOUND_PATH_ENV,
+    BOUND_TASK_ENV,
+    BOUND_EXPIRES_ENV,
+    ClaimReceipt,
+    QueueStateError,
+    claim_task,
+    requeue_claim,
+)
+from wo_runtime.core.validation import QueueContractError
+from wo_runtime.queue.locking import QueueBusyError
+from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, Workspace, load_workspace
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -66,6 +81,10 @@ class Invocation:
     log_state: ChildLogState = field(default_factory=ChildLogState)
     log_thread: threading.Thread | None = None
     heartbeat_thread: threading.Thread | None = None
+    claim: ClaimReceipt | None = None
+    started_monotonic: float = field(default_factory=time.monotonic)
+    deadline_monotonic: float = 0.0
+    timed_out: bool = False
 
 
 @dataclass
@@ -186,7 +205,8 @@ def subst(args: list[str], mapping: dict[str, str]) -> list[str]:
 
 
 def build_command(descriptor: dict, root: Path, cfg: dict, model: str | None,
-                  role_name: str = "", trigger_path: str | None = None) -> list[str]:
+                  role_name: str = "", trigger_path: str | None = None,
+                  claim: ClaimReceipt | None = None) -> list[str]:
     spec = descriptor["exec"]
     cmd = [descriptor["_bin"]] + subst(spec.get("args", []), {"cwd": str(root), "model": model or ""})
     if model and spec.get("model_flag"):
@@ -197,6 +217,19 @@ def build_command(descriptor: dict, root: Path, cfg: dict, model: str | None,
         prepend = resolve_context_prepend(descriptor, role_name, root, trigger_path=trigger_path)
         if prepend:
             payload = prepend + payload
+        if claim is not None:
+            binding = (
+                "[QUEUE-BINDING]\n"
+                f"task_id: {claim.task_id}\n"
+                f"claimed_path: {claim.path}\n"
+                f"lease_id: {claim.lease_id}\n"
+                f"attempt: {claim.attempt}\n"
+                f"lease_expires_at: {claim.lease_expires_at}\n"
+                "The task is already reserved for this invocation. The normal claim command "
+                "will return only this bound task. Complete or fail it using the bound lease/attempt.\n"
+                "[/QUEUE-BINDING]\n\n"
+            )
+            payload = binding + payload
         if spec.get("payload_position", "last") == "last":
             cmd.append(payload)
     return cmd
@@ -332,7 +365,7 @@ def project_python(root: Path) -> str:
     return sys.executable
 
 
-def runtime_env(root: Path, drop_env: set[str]) -> dict[str, str]:
+def runtime_env(root: Path, drop_env: set[str], extra: dict[str, str] | None = None) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in drop_env}
     py = project_python(root)
     py_dir = str(Path(py).parent)
@@ -342,7 +375,63 @@ def runtime_env(root: Path, drop_env: set[str]) -> dict[str, str]:
         [str(root), str(RUNTIME_ROOT)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
     )
     env["PATH"] = py_dir + os.pathsep + env.get("PATH", "")
+    if extra:
+        env.update(extra)
     return env
+
+
+def claim_env(receipt: ClaimReceipt | None) -> dict[str, str]:
+    if receipt is None:
+        return {}
+    return {
+        BOUND_TASK_ENV: receipt.task_id,
+        BOUND_LEASE_ENV: receipt.lease_id,
+        BOUND_ATTEMPT_ENV: str(receipt.attempt),
+        BOUND_PATH_ENV: receipt.path,
+        BOUND_EXPIRES_ENV: receipt.lease_expires_at,
+        "WO_RUNTIME_CLAIM_JSON": json.dumps(receipt.as_dict(), ensure_ascii=False, separators=(",", ":")),
+    }
+
+
+def popen_group_kwargs() -> dict[str, Any]:
+    if os.name == "nt":
+        flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return {"creationflags": flag} if flag else {}
+    return {"start_new_session": True}
+
+
+def terminate_process_group(proc: subprocess.Popen[str], grace_seconds: float) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=max(0.1, grace_seconds))
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=max(0.1, grace_seconds))
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def build_startup_probe_command(descriptor: dict, root: Path, model: str | None) -> list[str]:
@@ -453,9 +542,9 @@ def run_startup_probe(args: argparse.Namespace, root: Path, descriptor: dict,
 
 
 def heartbeat_child(root: Path, data_root: Path, trigger: str, runtime: str, role: str,
-                   proc: subprocess.Popen[str]) -> None:
+                   proc: subprocess.Popen[str], task_id: str = "") -> None:
     interval = max(1.0, float(os.environ.get("SUPERVISOR_HEARTBEAT_SECONDS", "15")))
-    task_id = Path(trigger).stem
+    task_id = task_id or Path(trigger).stem
     hb_dir = data_root / "heartbeats"
     hb_dir.mkdir(parents=True, exist_ok=True)
     hb_path = hb_dir / f"{task_id}.json"
@@ -495,11 +584,95 @@ def supervisable(descriptor: dict, roles: dict[str, dict]) -> dict[str, dict]:
     return {n: c for n, c in roles.items() if payload_field == "none" or c.get(payload_field)}
 
 
+def preclaim_trigger(
+    workspace: Workspace,
+    cfg: dict,
+    trigger: tuple[str, int, int],
+    *,
+    max_runtime_seconds: float,
+) -> ClaimReceipt | None:
+    trigger_path = workspace.root / trigger[0]
+    try:
+        task = json.loads(trigger_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(task, dict) or not task.get("id") or not task.get("capability") or not task.get("req_id"):
+        # Planner/gateway triggers are not queue tasks and retain their existing
+        # one-pass behavior.
+        return None
+    receipt = claim_task(
+        workspace,
+        str(task["capability"]),
+        str(cfg.get("worker_id") or task.get("capability") or "worker"),
+        task_id=str(task["id"]),
+        lease_ttl_seconds=(max_runtime_seconds + 60.0 if max_runtime_seconds > 0 else None),
+    )
+    if receipt.status not in {"claimed", "already_claimed"}:
+        raise QueueStateError(f"target_claim_lost:{task.get('id')}")
+    return receipt
+
+
+def role_runtime_seconds(
+    role_name: str,
+    cfg: dict,
+    fleet: dict[str, dict],
+    fallback: float,
+) -> float:
+    fleet_cfg = fleet.get(role_name) if isinstance(fleet.get(role_name), dict) else {}
+    raw = fleet_cfg.get("max_runtime_seconds", cfg.get("max_runtime_seconds", fallback))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"[supervisor] role={role_name} invalid max_runtime_seconds={raw!r}") from exc
+    if not math.isfinite(value) or value < 0:
+        raise SystemExit(f"[supervisor] role={role_name} max_runtime_seconds must be >= 0")
+    return value
+
+
+def release_invocation_claim(
+    workspace: Workspace,
+    invocation: Invocation,
+    *,
+    reason: str,
+    increment_attempt: bool,
+) -> bool:
+    receipt = invocation.claim
+    if receipt is None:
+        return False
+    result_path = workspace.data_root / "results" / f"{receipt.task_id}.json"
+    if result_path.exists():
+        # Completion writes the terminal result before moving claimed -> done.
+        # Let the orchestrator reconciliation pass finish that crash window.
+        return False
+    try:
+        return requeue_claim(
+            workspace,
+            receipt,
+            reason=reason,
+            increment_attempt=increment_attempt,
+        )
+    except (QueueContractError, QueueStateError, QueueBusyError, OSError, ValueError):
+        return False
+
+
 def run(args: argparse.Namespace) -> int:
+    if not math.isfinite(args.termination_grace) or args.termination_grace < 0:
+        raise SystemExit("[supervisor] termination grace must be a finite value >= 0")
     root_arg = args.workspace_root or args.root
-    workspace = load_workspace(root_arg, args.workspace_config)
-    root = workspace.root
-    data_root = workspace.data_root if workspace.data_root.is_absolute() else root / workspace.data_root
+    loaded_workspace = load_workspace(root_arg, args.workspace_config)
+    root = loaded_workspace.root
+    data_root = (
+        loaded_workspace.data_root
+        if loaded_workspace.data_root.is_absolute()
+        else root / loaded_workspace.data_root
+    )
+    workspace = Workspace(
+        root=root,
+        config_path=loaded_workspace.config_path,
+        config=loaded_workspace.config,
+        data_root_raw=loaded_workspace.data_root_raw,
+        data_root=data_root,
+    )
     descriptor = load_descriptor(root, args.runtime)
     descriptor["_bin"] = resolve_bin(descriptor, args.bin)
     roles = supervisable(descriptor, load_roles(root))
@@ -519,18 +692,44 @@ def run(args: argparse.Namespace) -> int:
     drop_env = set(role_env.values())
     state: dict[str, RoleState] = {n: RoleState() for n in roles}
     caps = {n: cap_for(n) for n in roles}
+    runtime_limits = {
+        name: role_runtime_seconds(name, cfg, fleet, args.invocation_timeout)
+        for name, cfg in roles.items()
+    }
+    once_scan_done = False
+    completed_codes: list[int] = []
+
+    def request_stop(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, request_stop)
     if args.startup_probe:
         run_startup_probe(args, root, descriptor, drop_env)
         if args.startup_probe_only:
             return 0
     log(args, "info", f"[supervisor] runtime={args.runtime} root={root} dry_run={args.dry_run} "
-        f"roles={{{', '.join(f'{n}x{caps[n]}' for n in roles)}}}")
+        f"roles={{{', '.join(f'{n}x{caps[n]}@{runtime_limits[n]:g}s' for n in roles)}}}")
     try:
         while True:
             for name, cfg in roles.items():
                 s = state[name]
                 alive = []
                 for i in s.inflight:
+                    if (
+                        i.process.poll() is None
+                        and i.deadline_monotonic > 0
+                        and time.monotonic() >= i.deadline_monotonic
+                    ):
+                        i.timed_out = True
+                        log(
+                            args,
+                            "error",
+                            f"[supervisor] role={name} trigger={i.trigger[0]} invocation deadline exceeded; "
+                            "terminating process group",
+                            file=sys.stderr,
+                        )
+                        terminate_process_group(i.process, args.termination_grace)
                     if i.process.poll() is None:
                         alive.append(i)
                     else:
@@ -594,6 +793,29 @@ def run(args: argparse.Namespace) -> int:
                                 )
                                 s.quota_notified = False
                                 clear_quota_state(root, args.runtime, name)
+                        if i.claim is not None:
+                            if i.timed_out:
+                                release_invocation_claim(
+                                    workspace,
+                                    i,
+                                    reason="runtime_invocation_timeout",
+                                    increment_attempt=True,
+                                )
+                            elif i.log_state.quota_seen and rc != 0:
+                                release_invocation_claim(
+                                    workspace,
+                                    i,
+                                    reason="runtime_quota_or_rate_limit",
+                                    increment_attempt=False,
+                                )
+                            else:
+                                release_invocation_claim(
+                                    workspace,
+                                    i,
+                                    reason=f"runtime_exit_without_terminal_result:{rc}",
+                                    increment_attempt=True,
+                                )
+                        completed_codes.append(124 if i.timed_out else int(rc or 0))
                 s.inflight = alive
                 now_ts = time.time()
                 quota_state = load_quota_state(root, args.runtime, name)
@@ -602,6 +824,8 @@ def run(args: argparse.Namespace) -> int:
                     s.quota_pause_until = pause_until
                     s.last_head = None
                     s.no_progress = 0
+                    continue
+                if args.once and once_scan_done:
                     continue
                 ready = list_triggers(root, cfg, ignore=s.blocked)
                 if not ready:
@@ -625,23 +849,64 @@ def run(args: argparse.Namespace) -> int:
                 slots = caps[name] - len(s.inflight)
                 launchable = [t for t in ready if t[0] not in targeted][:max(0, slots)]
                 for trig in launchable:
-                    cmd = build_command(descriptor, root, cfg,
-                                        resolve_model(descriptor, name, cfg, fleet, args.model),
-                                        role_name=name,
-                                        trigger_path=trig[0])
                     log(args, "info", f"[supervisor] role={name} trigger={trig[0]}")
                     if args.dry_run:
+                        cmd = build_command(
+                            descriptor,
+                            root,
+                            cfg,
+                            resolve_model(descriptor, name, cfg, fleet, args.model),
+                            role_name=name,
+                            trigger_path=trig[0],
+                        )
                         log(args, "info", f"[supervisor] would run: {printable(cmd)}")
                     else:
+                        receipt = None
+                        try:
+                            receipt = preclaim_trigger(
+                                workspace,
+                                cfg,
+                                trig,
+                                max_runtime_seconds=runtime_limits[name],
+                            )
+                        except (QueueContractError, QueueStateError, QueueBusyError, OSError, ValueError) as exc:
+                            log(
+                                args,
+                                "warn",
+                                f"[supervisor] role={name} trigger={trig[0]} pre-claim skipped: {exc}",
+                                file=sys.stderr,
+                            )
+                            continue
+                        context_trigger = receipt.path if receipt is not None else trig[0]
+                        cmd = build_command(
+                            descriptor,
+                            root,
+                            cfg,
+                            resolve_model(descriptor, name, cfg, fleet, args.model),
+                            role_name=name,
+                            trigger_path=context_trigger,
+                            claim=receipt,
+                        )
                         try:
                             proc = subprocess.Popen(
                                 cmd, cwd=root, text=True,
-                                env=runtime_env(root, drop_env),
+                                env=runtime_env(root, drop_env, claim_env(receipt)),
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,
                                 bufsize=1,
+                                **popen_group_kwargs(),
                             )
                         except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
+                            if receipt is not None:
+                                try:
+                                    requeue_claim(
+                                        workspace,
+                                        receipt,
+                                        reason=f"runtime_launch_failed:{type(exc).__name__}",
+                                        increment_attempt=False,
+                                    )
+                                except (QueueContractError, QueueStateError, QueueBusyError, OSError, ValueError):
+                                    pass
                             # Common causes: runtime binary not found on PATH (e.g.
                             # codex.cmd absent under WSL), CWD missing, or perms.
                             # Mark this trigger blocked so the supervisor doesn't
@@ -665,7 +930,15 @@ def run(args: argparse.Namespace) -> int:
                             log_thread.start()
                         heartbeat_thread = threading.Thread(
                             target=heartbeat_child,
-                            args=(root, data_root, trig[0], args.runtime, name, proc),
+                            args=(
+                                root,
+                                data_root,
+                                trig[0],
+                                args.runtime,
+                                name,
+                                proc,
+                                receipt.task_id if receipt is not None else "",
+                            ),
                             daemon=True,
                         )
                         heartbeat_thread.start()
@@ -675,19 +948,35 @@ def run(args: argparse.Namespace) -> int:
                             log_state=log_state,
                             log_thread=log_thread,
                             heartbeat_thread=heartbeat_thread,
+                            claim=receipt,
+                            deadline_monotonic=(
+                                time.monotonic() + runtime_limits[name]
+                                if runtime_limits[name] > 0
+                                else 0.0
+                            ),
                         ))
 
             if args.once:
                 alive = [i for s in state.values() for i in s.inflight]
-                if args.dry_run or not alive:
+                if args.dry_run:
                     return 0
-                return max(i.process.wait() for i in alive)
+                once_scan_done = True
+                if not alive:
+                    return max(completed_codes or [0])
+                time.sleep(min(args.interval, 0.1))
+                continue
             time.sleep(args.interval)
     except KeyboardInterrupt:
         log(args, "warn", "[supervisor] stopping", file=sys.stderr)
         for s in state.values():
             for i in s.inflight:
-                i.process.terminate()
+                terminate_process_group(i.process, args.termination_grace)
+                release_invocation_claim(
+                    workspace,
+                    i,
+                    reason="supervisor_shutdown",
+                    increment_attempt=False,
+                )
         return 130
 
 
@@ -716,6 +1005,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="minimum supervisor log level (default: info)")
     p.add_argument("--child-log-level", choices=["all", "warn", "error", "none"], default="all",
                    help="minimum child runtime output to keep (default: all)")
+    p.add_argument(
+        "--invocation-timeout",
+        type=float,
+        default=float(os.environ.get("SUPERVISOR_INVOCATION_TIMEOUT_SECONDS", "3600")),
+        help="hard wall-clock deadline per child invocation in seconds (default: 3600; 0 disables)",
+    )
+    p.add_argument(
+        "--termination-grace",
+        type=float,
+        default=float(os.environ.get("SUPERVISOR_TERMINATION_GRACE_SECONDS", "10")),
+        help="seconds between process-group terminate and kill (default: 10)",
+    )
     return p.parse_args(argv)
 
 

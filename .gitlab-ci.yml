@@ -1,0 +1,15 @@
+stages:
+  - test
+
+variables:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+runtime-core:
+  stage: test
+  image: "python:${PYTHON_VERSION}-bookworm"
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.10", "3.12"]
+  script:
+    - python -m compileall -q wo_runtime
+    - python bin/wo-runtime selftest

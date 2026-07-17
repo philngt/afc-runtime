@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib
 import json
 import shutil
 import sys
@@ -12,6 +14,7 @@ from wo_runtime.core.context import build_context
 from wo_runtime.core.context_packs import compact_worker_context, inline_input_max_bytes
 from wo_runtime.core.contracts import contract_path
 from wo_runtime.core.pipeline import PlanError, compile_request, validate_tasks
+from wo_runtime.core.validation import QueueContractError, safe_file, validate_identifier, validate_request_envelope
 from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, Workspace, ensure_data_root, load_workspace
 
 
@@ -44,17 +47,38 @@ def _load_request(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise PlanError("request_invalid:not_object")
+    validate_request_envelope(data)
     return data
+
+
+def _before_plan_request(workspace: Workspace, request: dict[str, Any], request_path: Path) -> dict[str, Any]:
+    hooks = workspace.config.get("instanceHooks") if isinstance(workspace.config.get("instanceHooks"), dict) else {}
+    module_name = str(hooks.get("planner") or "").strip()
+    if not module_name:
+        return request
+    if str(workspace.root) not in sys.path:
+        sys.path.insert(0, str(workspace.root))
+    module = importlib.import_module(module_name)
+    fn = getattr(module, "before_plan_request", None)
+    if fn is None:
+        return request
+    updated = fn(request, request_path, workspace.data_root, workspace.root)
+    if not isinstance(updated, dict):
+        raise PlanError("planner_hook_invalid:before_plan_request_must_return_object")
+    validate_request_envelope(updated)
+    return updated
 
 
 def _write_tasks(workspace: Workspace, tasks: list[dict[str, Any]]) -> None:
     pending = workspace.data_root / "tasks" / "pending"
     pending.mkdir(parents=True, exist_ok=True)
     for task in tasks:
-        task_id = str(task.get("id") or "")
-        if not task_id:
-            raise PlanError("dag_invalid:missing_task_id")
-        _write_json(pending / f"{task_id}.json", task)
+        try:
+            task_id = validate_identifier(task.get("id"), "task.id")
+            path = safe_file(pending, task_id, field="task.id")
+        except QueueContractError as exc:
+            raise PlanError(f"dag_invalid:{exc}") from exc
+        _write_json(path, task)
 
 
 def _write_failed_final(workspace: Workspace, req_id: str, error: str, *, request_ref: str | None = None) -> None:
@@ -67,7 +91,16 @@ def _write_failed_final(workspace: Workspace, req_id: str, error: str, *, reques
     }
     if request_ref:
         payload["requestRef"] = request_ref
-    _write_json(workspace.data_root / "results" / f"{req_id}.final.json", payload)
+    path = safe_file(workspace.data_root / "results", req_id, suffix=".final.json", field="request.id")
+    _write_json(path, payload)
+
+
+def _failure_request_id(candidate: str, source: Path) -> str:
+    try:
+        return validate_identifier(candidate, "request.id")
+    except QueueContractError:
+        digest = hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:16]
+        return f"invalid-{digest}"
 
 
 def _processed_target(path: Path) -> Path:
@@ -89,7 +122,7 @@ def _plan_request(workspace: Workspace, request: dict[str, Any]) -> dict[str, An
 def cmd_plan(args: argparse.Namespace) -> int:
     workspace = _workspace(args)
     path = Path(args.request_file)
-    request = _load_request(path)
+    request = _before_plan_request(workspace, _load_request(path), path)
     plan = _plan_request(workspace, request)
     if args.write:
         _write_tasks(workspace, plan["tasks"])
@@ -108,12 +141,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
 def _plan_inbox_item(workspace: Workspace, path: Path, *, dry_run: bool) -> tuple[str, int]:
     req_id = path.stem
     try:
-        request = _load_request(path)
+        request = _before_plan_request(workspace, _load_request(path), path)
         req_id = str(request.get("id") or req_id)
         plan = _plan_request(workspace, request)
     except Exception as exc:
         error = f"parse_error:{exc}"
         if not dry_run:
+            req_id = _failure_request_id(req_id, path)
             _write_failed_final(workspace, req_id, error, request_ref=str(path))
             path.replace(_processed_target(path))
             _event(workspace, {"event": "plan_failed", "req_id": req_id, "error": error})

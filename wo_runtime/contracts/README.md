@@ -11,7 +11,7 @@ restrict `capability` to product roles, while this runtime-level schema keeps
 `capability` open because adapter descriptors define capabilities per
 workspace.
 
-V1 ownership:
+Contract surface:
 
 - `request.schema.json`, `task.schema.json`, and `result.schema.json` define the
   domain-neutral queue envelope.
@@ -22,3 +22,9 @@ V1 ownership:
   product/channel enums.
 - Instance schemas remain the compatibility surface for product-specific
   validation until those constraints are split into separate instance contracts.
+
+Queue ownership and mutation semantics are versioned as `queue.v2`; see
+`docs/QUEUE.md`. Existing envelope field names remain stable. Claimed tasks
+add `claim.lease_id`, `claim.attempt`, `claim.claimed_at`, and
+`claim.lease_expires_at`; owned terminal results add `lease_id`, `attempt`, and
+`result_digest`.

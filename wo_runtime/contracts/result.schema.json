@@ -5,12 +5,19 @@
   "type": "object",
   "required": [
     "task_id",
-    "status"
+    "worker",
+    "status",
+    "queue_contract",
+    "lease_id",
+    "attempt",
+    "result_digest"
   ],
   "properties": {
     "task_id": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@+~-]*$"
     },
     "worker": {
       "type": "string"
@@ -55,6 +62,26 @@
     },
     "ts": {
       "type": "string"
+    },
+    "queue_contract": {
+      "type": "string",
+      "enum": [
+        "queue.v2"
+      ]
+    },
+    "lease_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@+~-]*$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "result_digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
     }
   },
   "additionalProperties": true
