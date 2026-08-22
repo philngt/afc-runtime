@@ -46,6 +46,8 @@ Documentation:
 - `docs/CORE.md` - core planner/context command contract and required instance data.
 - `docs/QUEUE.md` - safe paths, targeted leases, terminal idempotency, deadlines, and instance hooks.
 - `docs/PRIMITIVES.md` - reusable Python APIs, ownership boundaries, contract validation, and worker examples.
+- `docs/WORKFLOW-AUTHORING.md` - how an agent builds and verifies a new thin workflow instance.
+- `docs/prompts/CREATE-SHORT-VIDEO-WORKFLOW.vi.md` - copy-ready Vietnamese example prompt.
 - `wo_runtime/contracts/README.md` - runtime-neutral queue/result/context contracts.
 
 ## License

@@ -49,6 +49,21 @@ Instance repositories own:
 - Runtime descriptors are data. Adding a runtime should normally require only an
   instance `runtime/runtimes/<name>.json` descriptor and selftest coverage.
 
+## Creating workflow instances
+
+When a user asks to build a new workflow based on this repository:
+
+1. Read `docs/WORKFLOW-AUTHORING.md` before creating files.
+2. Create or modify a thin instance repository; keep product and provider policy
+   out of `wo_runtime/`.
+3. Implement the runnable workflow, contracts, tests, and validation gates. Do
+   not stop at an architecture proposal when the user asked to build it.
+4. Pin the exact runtime commit used by the instance and preserve `queue.v2`
+   receipt fencing.
+5. Use `docs/prompts/CREATE-SHORT-VIDEO-WORKFLOW.vi.md` as a concrete prompt
+   example, adapting its product requirements rather than copying them into the
+   runtime core.
+
 ## Commands
 
 Run from this repo:
@@ -76,5 +91,6 @@ vendor/woafc-runtime/bin/wo-runtime core validate-dag --workspace-root "$PWD" --
 - Run `vendor/woafc-runtime/bin/wo-runtime runtime selftest --workspace-root
   "$PWD"` from at least one instance when changing runtime adapters,
   descriptors, supervisor behavior, or workspace resolution.
-- Keep changes scoped to runtime reuse. Move instance-building guidance,
-  checklists, skills, and product-specific docs to the instance/template repo.
+- Keep code changes scoped to runtime reuse. Generic authoring instructions and
+  clearly labeled prompt examples may live in `docs/`; product implementation,
+  operating policy, checklists, and skills belong in the instance/template repo.
