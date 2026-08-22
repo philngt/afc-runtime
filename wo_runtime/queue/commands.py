@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from wo_runtime.core.context import build_context
+from wo_runtime.core.contracts import load_contract
+from wo_runtime.core.schema import validate_json_schema
 from wo_runtime.core.validation import (
     QUEUE_CONTRACT_VERSION,
     QueueContractError,
@@ -196,6 +198,28 @@ def _validate_task_result_hook(
             fn(deepcopy(task), deepcopy(result), status, workspace.data_root, workspace.root)
     except Exception as exc:
         raise QueueStateError(f"result_validation_failed:{type(exc).__name__}:{exc}") from exc
+
+
+def _validate_declared_output_contract(
+    workspace: Workspace,
+    task: dict[str, Any],
+    result: Any,
+    status: str,
+) -> None:
+    """Apply a task's declared output contract before instance invariants."""
+
+    if status != "success":
+        return
+    contract_id = str(task.get("outputContract") or "").strip()
+    if not contract_id:
+        return
+    try:
+        schema = load_contract(contract_id, task, workspace=workspace)
+        validate_json_schema(result, schema)
+    except Exception as exc:
+        raise QueueStateError(
+            f"output_contract_validation_failed:{contract_id}:{type(exc).__name__}:{exc}"
+        ) from exc
 
 
 def claim_task(
@@ -512,7 +536,19 @@ def _terminal_commit(
         _require_active_lease(meta, task_id)
         if done_path.exists():
             raise QueueStateError(f"done_without_terminal_result:{task_id}")
-        _validate_task_result_hook(workspace, task, payload.get("result"), str(payload.get("status") or ""))
+        terminal_status = str(payload.get("status") or "")
+        _validate_declared_output_contract(
+            workspace,
+            task,
+            payload.get("result"),
+            terminal_status,
+        )
+        _validate_task_result_hook(
+            workspace,
+            task,
+            payload.get("result"),
+            terminal_status,
+        )
         # The validation hook can perform I/O. Re-check the hard lease at the
         # actual commit boundary rather than relying only on the pre-hook check.
         _require_active_lease(meta, task_id)
@@ -547,6 +583,67 @@ def _terminal_binding(args: Any) -> tuple[str, int, str]:
     if attempt is None:
         raise QueueStateError("claim_attempt_required: pass --attempt or WO_RUNTIME_CLAIM_ATTEMPT")
     return lease_id, attempt, expected_digest
+
+
+def complete_claim(
+    workspace: Workspace,
+    receipt: ClaimReceipt,
+    result: Any,
+    *,
+    expected_digest: str = "",
+) -> bool:
+    """Commit a successful result through the queue.v2 fenced boundary.
+
+    The return value is ``True`` for an idempotent replay and ``False`` for a
+    newly committed result.
+    """
+
+    payload: dict[str, Any] = {
+        "task_id": receipt.task_id,
+        "worker": receipt.worker,
+        "status": "success",
+        "result": result,
+        "ts": _ts(),
+    }
+    return _terminal_commit(
+        workspace,
+        payload,
+        lease_id=receipt.lease_id,
+        attempt=receipt.attempt,
+        expected_digest=expected_digest,
+    )
+
+
+def fail_claim(
+    workspace: Workspace,
+    receipt: ClaimReceipt,
+    error: str,
+    *,
+    recovery: Any | None = None,
+    artifact_type: str = "",
+    expected_digest: str = "",
+) -> bool:
+    """Commit a failed result through the queue.v2 fenced boundary."""
+
+    payload: dict[str, Any] = {
+        "task_id": receipt.task_id,
+        "worker": receipt.worker,
+        "status": "failed",
+        "result": None,
+        "error": str(error),
+        "ts": _ts(),
+    }
+    if recovery is not None:
+        payload["recovery"] = recovery
+    if artifact_type:
+        payload["artifact_type"] = artifact_type
+    return _terminal_commit(
+        workspace,
+        payload,
+        lease_id=receipt.lease_id,
+        attempt=receipt.attempt,
+        expected_digest=expected_digest,
+    )
 
 
 def complete(args: Any) -> int:

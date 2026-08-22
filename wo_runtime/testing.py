@@ -9,7 +9,20 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from wo_runtime.artifacts import (
+    ArtifactConflictError,
+    ContentAddressedStore,
+    idempotent_write_json,
+)
 from wo_runtime.core.validation import result_digest, validate_terminal_result_binding
+from wo_runtime.status import RequestStatusReader
+from wo_runtime.worker import (
+    BoundClaim,
+    RuntimeTerminal,
+    WorkerError,
+    load_bound_task,
+    resolve_task_inputs,
+)
 
 
 def run_synthetic_selftest() -> int:
@@ -100,12 +113,65 @@ def run_synthetic_selftest() -> int:
                 return False
             return True
 
+        manifest_path = data / "assets" / "selftest-manifest.json"
+        created = idempotent_write_json(manifest_path, {"schemaVersion": 1})
+        replayed = idempotent_write_json(manifest_path, {"schemaVersion": 1})
+        conflict_rejected = False
+        try:
+            idempotent_write_json(manifest_path, {"schemaVersion": 2})
+        except ArtifactConflictError:
+            conflict_rejected = True
+        store = ContentAddressedStore(data / "assets" / "objects")
+        captured_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        first_ref = store.write_bytes(
+            "selftest",
+            b"runtime-artifact",
+            extension="bin",
+            captured_at=captured_at,
+        )
+        replay_ref = store.write_bytes(
+            "selftest",
+            b"runtime-artifact",
+            extension="bin",
+            captured_at=captured_at,
+        )
+        if not check(
+            created
+            and not replayed
+            and conflict_rejected
+            and first_ref == replay_ref,
+            "artifact writes are immutable and replay-safe",
+        ):
+            return 1
+
         claim = run("queue", "claim", "wk", "w1", "--task-id", "t1", "--json")
         if claim.returncode != 0 or ".run/data/tasks/claimed/t1.json" not in claim.stdout:
             print(claim.stderr or claim.stdout, file=sys.stderr)
             return 1
 
         claim_receipt = json.loads(claim.stdout)
+        claim_environment = {
+            "WO_RUNTIME_CLAIM_JSON": claim.stdout.strip(),
+            "WO_RUNTIME_TASK_ID": claim_receipt["task_id"],
+            "WO_RUNTIME_CLAIM_LEASE": claim_receipt["lease_id"],
+            "WO_RUNTIME_CLAIM_ATTEMPT": str(claim_receipt["attempt"]),
+            "WO_RUNTIME_CLAIM_EXPIRES_AT": claim_receipt["lease_expires_at"],
+            "WO_RUNTIME_CLAIM_PATH": claim_receipt["path"],
+        }
+        try:
+            bound_claim = BoundClaim.from_environment(root, environ=claim_environment)
+            if bound_claim is None:
+                raise WorkerError("missing claim")
+            bound_task = load_bound_task(bound_claim)
+            created_terminal = RuntimeTerminal(root, bound_claim).complete({"ok": True})
+        except WorkerError as exc:
+            print(f"synthetic selftest: receipt-bound worker failed: {exc}", file=sys.stderr)
+            return 1
+        if not check(
+            bound_task.get("id") == "t1" and created_terminal is False,
+            "receipt-bound worker commits through queue fencing",
+        ):
+            return 1
         complete = run(
             "queue", "complete", "t1", '{"ok":true}', "w1",
             "--lease-id", claim_receipt["lease_id"], "--attempt", str(claim_receipt["attempt"]),
@@ -116,6 +182,97 @@ def run_synthetic_selftest() -> int:
         result = json.loads((data / "results" / "t1.json").read_text(encoding="utf-8"))
         if result.get("status") != "success" or result.get("result") != {"ok": True}:
             print("synthetic selftest: complete result mismatch", file=sys.stderr)
+            return 1
+        status = RequestStatusReader(data).project("R")
+        if not check(
+            status.state == "success"
+            and status.successful == 1
+            and status.total == 1
+            and status.percent == 100,
+            "status projection follows materialized tasks and terminal results",
+        ):
+            return 1
+        resolved_inputs = resolve_task_inputs(
+            root,
+            {"inputs": [{"task_id": "t1", "as": "upstream"}]},
+        )
+        missing_input_rejected = False
+        try:
+            resolve_task_inputs(
+                root,
+                {"inputs": [{"task_id": "missing", "as": "upstream"}]},
+            )
+        except WorkerError:
+            missing_input_rejected = True
+        if not check(
+            resolved_inputs == {"upstream": {"ok": True}}
+            and missing_input_rejected,
+            "worker input resolution is strict",
+        ):
+            return 1
+
+        # A declared instance contract is a generic terminal boundary, not an
+        # optional product hook concern.
+        contracts = root / "contracts"
+        contracts.mkdir(parents=True, exist_ok=True)
+        (contracts / "contract-index.json").write_text(
+            json.dumps({"contracts": {"answer.v1": "answer.schema.json"}}),
+            encoding="utf-8",
+        )
+        (contracts / "answer.schema.json").write_text(
+            json.dumps({
+                "$id": "answer.v1",
+                "type": "object",
+                "required": ["contract", "answer"],
+                "properties": {
+                    "contract": {"const": "answer.v1"},
+                    "answer": {"type": "string"},
+                },
+                "additionalProperties": False,
+            }),
+            encoding="utf-8",
+        )
+        contract_id = "contract-task"
+        (ready / f"{contract_id}.json").write_text(
+            json.dumps({
+                "queue_contract": "queue.v2",
+                "id": contract_id,
+                "req_id": "CONTRACT",
+                "capability": "wk",
+                "depends_on": [],
+                "outputContract": "answer.v1",
+            }),
+            encoding="utf-8",
+        )
+        contract_claim = run(
+            "queue", "claim", "wk", "contract-worker",
+            "--task-id", contract_id, "--json",
+        )
+        contract_receipt = json.loads(contract_claim.stdout)
+        invalid_contract = run(
+            "queue", "complete", contract_id, '{"contract":"answer.v1","answer":7}',
+            "contract-worker",
+            "--lease-id", contract_receipt["lease_id"],
+            "--attempt", str(contract_receipt["attempt"]),
+        )
+        if not check(
+            invalid_contract.returncode != 0
+            and (data / "tasks" / "claimed" / f"{contract_id}.json").exists()
+            and not (data / "results" / f"{contract_id}.json").exists(),
+            "declared output contract rejects invalid terminal result before write",
+        ):
+            return 1
+        valid_contract = run(
+            "queue", "complete", contract_id,
+            '{"contract":"answer.v1","answer":"ok"}', "contract-worker",
+            "--lease-id", contract_receipt["lease_id"],
+            "--attempt", str(contract_receipt["attempt"]),
+        )
+        if not check(
+            valid_contract.returncode == 0
+            and (data / "results" / f"{contract_id}.json").exists(),
+            "declared output contract accepts valid fenced terminal result",
+        ):
             return 1
 
         pending = data / "tasks" / "pending"

@@ -111,6 +111,19 @@ Resolution order is instance contracts, domain contracts, then runtime contracts
 Domain profiles may still block external absolute resource paths through their
 resolver policy.
 
+## Shared schema, artifact, and status primitives
+
+- `wo_runtime.core.schema` loads and validates the dependency-free JSON Schema
+  subset used by runtime and instance contracts. All `$ref` values fail closed.
+- `wo_runtime.artifacts` provides atomic JSON/text/byte writes, idempotent
+  immutable JSON writes, and a verified content-addressed store.
+- `wo_runtime.status.RequestStatusReader` projects request/task state from
+  materialized task envelopes and terminal results. Callers may provide neutral
+  expected task envelopes only as a pre-planning compatibility fallback.
+- `wo_runtime.core.context.resolve_inputs(..., strict=True)` turns missing,
+  malformed, or unsuccessful dependency results into execution errors. The
+  default warning mode remains available for diagnostic context assembly.
+
 ## Invariants
 
 - Runtime core writes only queue/runtime artifacts under the configured data root.

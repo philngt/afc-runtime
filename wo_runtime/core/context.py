@@ -21,6 +21,10 @@ from wo_runtime.workspace import Workspace
 TASK_AREAS = ["pending", "claimed", "done", "failed", "invalid"]
 
 
+class InputResolutionError(RuntimeError):
+    """A task dependency cannot be resolved at the execution boundary."""
+
+
 def rel(workspace: Workspace, path: Path) -> str:
     try:
         return path.resolve().relative_to(workspace.root).as_posix()
@@ -84,24 +88,41 @@ def resolve_domain_and_pipeline(task: dict[str, Any], *, workspace: Workspace | 
     return str(domain_id), str(pipeline_id)
 
 
-def resolve_inputs(task: dict[str, Any], *, workspace: Workspace | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def resolve_inputs(
+    task: dict[str, Any],
+    *,
+    workspace: Workspace | None = None,
+    strict: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     ws = current_workspace(workspace)
     resolved: dict[str, Any] = {}
     warnings: list[dict[str, Any]] = []
     inputs = task.get("inputs") if isinstance(task.get("inputs"), list) else []
     for item in inputs:
         if not isinstance(item, dict):
+            if strict:
+                raise InputResolutionError("task input reference must be an object")
             continue
         task_id = str(item.get("task_id") or "").strip()
         alias = str(item.get("as") or task_id).strip()
-        if not task_id:
+        if not task_id or not alias:
+            if strict:
+                raise InputResolutionError("task input reference is incomplete")
             continue
         path = ws.data_root / "results" / f"{task_id}.json"
         payload = read_json(path)
         if not payload:
+            if strict:
+                raise InputResolutionError(
+                    f"successful dependency result is missing: {task_id}"
+                )
             warnings.append({"code": "input_result_missing", "taskId": task_id, "as": alias, "path": rel(ws, path)})
             continue
         if payload.get("status") != "success":
+            if strict:
+                raise InputResolutionError(
+                    f"dependency result is not successful: {task_id}"
+                )
             warnings.append({
                 "code": "input_result_not_success",
                 "taskId": task_id,

@@ -74,6 +74,25 @@ Orchestrator-generated dependency failures, canonical media aliases, and manual
 human-review terminals use the same claim/result binding. They do not bypass
 the queue contract.
 
+### Receipt-bound Python workers
+
+Instances can use the same boundary without constructing CLI argument objects:
+
+```python
+from wo_runtime.worker import BoundClaim, RuntimeTerminal, load_bound_task, resolve_task_inputs
+
+claim = BoundClaim.from_environment(workspace)
+task = load_bound_task(claim)
+inputs = resolve_task_inputs(workspace, task)
+terminal = RuntimeTerminal(workspace, claim)
+terminal.complete(handler(task, inputs))
+```
+
+`BoundClaim.from_environment` rejects partial or contradictory bindings and
+paths outside `tasks/claimed`. `RuntimeTerminal.complete`, `fail`, and
+`requeue` preserve the task, worker, lease, and attempt receipt; requeue keeps
+the current attempt unless explicitly requested otherwise.
+
 ## Owned requeue
 
 Provider holds and other non-terminal releases use the queue command rather
@@ -121,7 +140,9 @@ Instance modules are selected in `runtime/workspace.json`:
   runs after generic request/path validation and before DAG compilation. Its
   returned request is validated again.
 - `validate_task_result(task, result, status, data_root, workspace_root)` runs
-  before a successful owned terminal result is written; raising rejects it.
+  after generic `outputContract` schema validation and before a successful
+  owned terminal result is written; raising rejects instance-specific
+  invariants.
 - `finalization_decision(req_id, tasks, root_task, root_result, final, **kwargs)`
   may return `{"action":"allow"}`, `{"action":"defer","reason":"..."}`,
   or `{"action":"reject","reason":"..."}`.
