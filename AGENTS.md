@@ -14,6 +14,8 @@ This repo owns:
 - `bin/wo-runtime`
 - `wo_runtime/`
 - `wo_runtime/contracts/`
+- `plugins/` for optional, separately packaged integrations that depend on the
+  runtime without becoming part of its channel-neutral core
 - `docs/`
 - runtime-neutral selftests in `wo_runtime/testing.py` and
   `wo_runtime/runtime/selftest.py`
@@ -34,6 +36,9 @@ Instance repositories own:
 - Keep runtime code domain-neutral. Do not add product-family, marketplace,
   locale, channel, provider, media-layout, safety-policy, or listing-policy
   literals to `wo_runtime/`.
+- A channel-specific integration may live under `plugins/<name>/`. Core code
+  must not import a plugin, plugins stay disabled unless an instance explicitly
+  starts them, and each plugin owns its independent package tests.
 - Queue contracts in `wo_runtime/contracts/` are the reusable compatibility
   surface. Do not rename existing fields; prefer optional additive fields.
 - A role invocation performs exactly one pass, reports briefly, and stops. The
@@ -88,6 +93,7 @@ vendor/woafc-runtime/bin/wo-runtime core validate-dag --workspace-root "$PWD" --
 
 - Run `git diff --check`.
 - Run `bin/wo-runtime selftest` for runtime behavior changes.
+- Run the tests documented by any changed package under `plugins/`.
 - Run `vendor/woafc-runtime/bin/wo-runtime runtime selftest --workspace-root
   "$PWD"` from at least one instance when changing runtime adapters,
   descriptors, supervisor behavior, or workspace resolution.

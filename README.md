@@ -41,6 +41,24 @@ The core layer reads instance data from `runtime/workspace.json`, `domains/`,
 family literals; pipeline selection, fanout defaults, input aliases, and context
 contract/audit policy are instance data.
 
+## Optional plugins
+
+Channel-specific integrations live as separately packaged, opt-in components
+under `plugins/`, outside the channel-neutral `wo_runtime` package. A plugin may
+depend on stable runtime contracts; the runtime core must never import a plugin.
+
+The initial plugin scaffold is
+[`plugins/telegram-assistant`](plugins/telegram-assistant/README.md). It defines
+the transport-facing assistant compatibility contract and safety boundary for a
+single-workspace Telegram admin assistant. It is not enabled by installing or
+vendoring the runtime, and it does not yet replace an instance's existing
+gateway implementation.
+
+Keeping the plugin in this monorepo lets an instance pin one runtime commit while
+the assistant contract is still evolving. It can be split into an independently
+versioned repository later if it gains non-AFC consumers or a separate release
+and security cadence.
+
 ## Build a new workflow instance
 
 Use this repository as a pinned runtime dependency, not as the place for product
@@ -130,6 +148,7 @@ Documentation:
 - `docs/PRIMITIVES.md` - reusable Python APIs, ownership boundaries, contract validation, and worker examples.
 - `docs/WORKFLOW-AUTHORING.md` - how an agent builds and verifies a new thin workflow instance.
 - `docs/prompts/CREATE-SHORT-VIDEO-WORKFLOW.vi.md` - copy-ready Vietnamese example prompt.
+- `plugins/telegram-assistant/README.md` - optional Telegram admin-assistant plugin boundary.
 - `wo_runtime/contracts/README.md` - runtime-neutral queue/result/context contracts.
 
 ## License

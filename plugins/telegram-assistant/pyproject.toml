@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "afc-telegram-assistant"
+version = "0.1.0"
+description = "Optional Telegram ingress plugin for AFC workflow assistants."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = []
+
+[project.scripts]
+afc-telegram-assistant = "afc_telegram_assistant.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
