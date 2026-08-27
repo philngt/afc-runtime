@@ -47,12 +47,12 @@ Channel-specific integrations live as separately packaged, opt-in components
 under `plugins/`, outside the channel-neutral `wo_runtime` package. A plugin may
 depend on stable runtime contracts; the runtime core must never import a plugin.
 
-The initial plugin scaffold is
+The first optional plugin is
 [`plugins/telegram-assistant`](plugins/telegram-assistant/README.md). It defines
-the transport-facing assistant compatibility contract and safety boundary for a
-single-workspace Telegram admin assistant. It is not enabled by installing or
-vendoring the runtime, and it does not yet replace an instance's existing
-gateway implementation.
+the Bot API transport, assistant compatibility contract, process lifecycle, and
+safety boundary for a single-workspace Telegram admin assistant. It remains
+disabled until an instance explicitly starts it with a named host adapter; the
+instance continues to own authorization, SQLite truth, approvals, and backends.
 
 Keeping the plugin in this monorepo lets an instance pin one runtime commit while
 the assistant contract is still evolving. It can be split into an independently

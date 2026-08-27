@@ -14,7 +14,7 @@ Rules for every plugin:
 - it is packaged and tested independently;
 - adding a plugin does not add a dynamic plugin loader to the runtime core.
 
-Available scaffolds:
+Available plugins:
 
 - [`telegram-assistant`](telegram-assistant/README.md) — optional Telegram
   ingress for one workflow's admin assistant.

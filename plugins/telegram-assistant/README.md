@@ -9,9 +9,10 @@ authorization, storage, approval, prompt, and runtime-backend adapters.
 
 ## Status
 
-This scaffold establishes the package, compatibility contract, safety boundary,
-and shared runtime commit pin. It does not yet replace a host workflow's existing
-Telegram gateway implementation.
+The plugin owns the dependency-free Bot API transport, single-workspace process
+lifecycle, clean signal handling, and runtime-neutral assistant contracts. The
+host workflow injects one explicit gateway factory that owns authorization,
+SQLite state, approval rules, prompts, and runtime backends.
 
 ## Dependency direction
 
@@ -46,5 +47,14 @@ PYTHONPATH=src python3 -m afc_telegram_assistant --version
 ```
 
 Consumers pin the enclosing `afc-runtime` repository and start the plugin
-explicitly. Dynamic plugin discovery is intentionally deferred until more than
-one external connector demonstrates a common loading contract.
+explicitly:
+
+```bash
+python plugins/telegram-assistant/bin/afc-telegram-assistant run \
+  --workspace-root /absolute/workspace \
+  --factory workflow.telegram.plugin:create_gateway
+```
+
+Arguments after `--` are delivered only to the explicit host factory. Dynamic
+plugin discovery is intentionally absent: one process loads one named adapter
+and binds one resolved workspace.
