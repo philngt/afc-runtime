@@ -36,6 +36,13 @@ from wo_runtime.worker import BoundClaim, RuntimeTerminal, load_bound_task, reso
 CLI. A task with `outputContract` is schema-validated by the runtime before its
 instance result hook and before any terminal file is written.
 
+Headless queue roles can also opt into **host-owned structured output** with
+`exec.result_protocol: "json-file"`. The child writes a schema-constrained JSON
+candidate; the supervisor validates it and commits through the same fenced queue
+boundary. Existing worker descriptors keep their behavior. See
+[`docs/STRUCTURED-OUTPUT.md`](docs/STRUCTURED-OUTPUT.md) for the descriptor contract,
+failure behavior, and an instance-level Codex CLI example.
+
 The core layer reads instance data from `runtime/workspace.json`, `domains/`,
 `pipelines/`, and `contracts/contract-index.json`. It must not contain product
 family literals; pipeline selection, fanout defaults, input aliases, and context
@@ -146,6 +153,7 @@ Documentation:
 - `docs/CORE.md` - core planner/context command contract and required instance data.
 - `docs/QUEUE.md` - safe paths, targeted leases, terminal idempotency, deadlines, and instance hooks.
 - `docs/PRIMITIVES.md` - reusable Python APIs, ownership boundaries, contract validation, and worker examples.
+- `docs/STRUCTURED-OUTPUT.md` - opt-in host-owned structured results for headless queue roles.
 - `docs/WORKFLOW-AUTHORING.md` - how an agent builds and verifies a new thin workflow instance.
 - `docs/prompts/CREATE-SHORT-VIDEO-WORKFLOW.vi.md` - copy-ready Vietnamese example prompt.
 - `plugins/telegram-assistant/README.md` - optional Telegram admin-assistant plugin boundary.

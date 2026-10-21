@@ -31,9 +31,11 @@ hooks.
 
 ## Receipt-bound worker
 
-A supervised worker receives a JSON claim receipt and matching scalar bindings
-in its environment. Treat those values as one receipt; do not reconstruct them
-from a task id or scan the claimed directory.
+A supervised worker using the default `worker` result protocol receives a JSON
+claim receipt and matching scalar bindings in its environment. Treat those
+values as one receipt; do not reconstruct them from a task id or scan the
+claimed directory. The opt-in [`json-file` protocol](STRUCTURED-OUTPUT.md) keeps
+that receipt in the host and requires only a candidate result from the child.
 
 ```python
 from pathlib import Path

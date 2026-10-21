@@ -33,6 +33,13 @@ from pathlib import Path
 from typing import Any
 
 from wo_runtime.runtime.context import resolve_context_prepend
+from wo_runtime.runtime.structured import (
+    StructuredOutput,
+    StructuredResultError,
+    prepare_structured_output,
+    read_structured_result,
+    structured_output_enabled,
+)
 from wo_runtime.queue.commands import (
     BOUND_ATTEMPT_ENV,
     BOUND_LEASE_ENV,
@@ -42,6 +49,7 @@ from wo_runtime.queue.commands import (
     ClaimReceipt,
     QueueStateError,
     claim_task,
+    complete_claim,
     requeue_claim,
 )
 from wo_runtime.core.validation import QueueContractError
@@ -82,6 +90,7 @@ class Invocation:
     log_thread: threading.Thread | None = None
     heartbeat_thread: threading.Thread | None = None
     claim: ClaimReceipt | None = None
+    structured_output: StructuredOutput | None = None
     started_monotonic: float = field(default_factory=time.monotonic)
     deadline_monotonic: float = 0.0
     timed_out: bool = False
@@ -206,18 +215,46 @@ def subst(args: list[str], mapping: dict[str, str]) -> list[str]:
 
 def build_command(descriptor: dict, root: Path, cfg: dict, model: str | None,
                   role_name: str = "", trigger_path: str | None = None,
-                  claim: ClaimReceipt | None = None) -> list[str]:
+                  claim: ClaimReceipt | None = None,
+                  structured_output: StructuredOutput | None = None) -> list[str]:
     spec = descriptor["exec"]
-    cmd = [descriptor["_bin"]] + subst(spec.get("args", []), {"cwd": str(root), "model": model or ""})
+    structured = structured_output_enabled(descriptor)
+    mapping = {"cwd": str(root), "model": model or ""}
+    if structured:
+        # A dry-run previews these placeholders without claiming work or
+        # allocating invocation artifacts. Real paths exist only after claim.
+        mapping.update({
+            "output_schema": str(structured_output.schema_path) if structured_output else "{output_schema}",
+            "task_context": str(structured_output.context_path) if structured_output else "{task_context}",
+            "output_path": str(structured_output.output_path) if structured_output else "{output_path}",
+        })
+    cmd = [descriptor["_bin"]] + subst(spec.get("args", []), mapping)
     if model and spec.get("model_flag"):
-        cmd += subst(spec["model_flag"], {"model": model})
+        cmd += subst(spec["model_flag"], mapping)
     payload_field = spec.get("payload")
     if payload_field and payload_field != "none":
         payload = str(cfg.get(payload_field, "")).replace("{worker_id}", str(cfg.get("worker_id", "")))
-        prepend = resolve_context_prepend(descriptor, role_name, root, trigger_path=trigger_path)
+        # Materialized context can write files, so structured dry-runs omit it.
+        prepend = (
+            resolve_context_prepend(descriptor, role_name, root, trigger_path=trigger_path)
+            if not structured or structured_output is not None
+            else ""
+        )
         if prepend:
             payload = prepend + payload
-        if claim is not None:
+        if structured:
+            payload = (
+                "[STRUCTURED-OUTPUT]\n"
+                f"task_context: {mapping['task_context']}\n"
+                f"output_schema: {mapping['output_schema']}\n"
+                f"output_path: {mapping['output_path']}\n"
+                "Perform one task using the task and resolved inputs in task_context. "
+                "Return only the task result matching output_schema. The adapter records "
+                "your final JSON at output_path. The host validates and commits the result. "
+                "Do not claim, complete, fail, or requeue tasks; the host owns the queue.\n"
+                "[/STRUCTURED-OUTPUT]\n\n"
+            ) + payload
+        elif claim is not None:
             binding = (
                 "[QUEUE-BINDING]\n"
                 f"task_id: {claim.task_id}\n"
@@ -581,6 +618,8 @@ def heartbeat_child(root: Path, data_root: Path, trigger: str, runtime: str, rol
 
 def supervisable(descriptor: dict, roles: dict[str, dict]) -> dict[str, dict]:
     payload_field = descriptor["exec"].get("payload", "prompt")
+    if structured_output_enabled(descriptor) and "payload" not in descriptor["exec"]:
+        payload_field = "none"
     return {n: c for n, c in roles.items() if payload_field == "none" or c.get(payload_field)}
 
 
@@ -674,6 +713,12 @@ def run(args: argparse.Namespace) -> int:
         data_root=data_root,
     )
     descriptor = load_descriptor(root, args.runtime)
+    try:
+        structured = structured_output_enabled(descriptor)
+    except StructuredResultError as exc:
+        raise SystemExit(f"[supervisor] invalid runtime descriptor: {exc}") from exc
+    if structured and (args.startup_probe or args.startup_probe_only):
+        raise SystemExit("[supervisor] startup probes are not supported with exec.result_protocol=json-file")
     descriptor["_bin"] = resolve_bin(descriptor, args.bin)
     roles = supervisable(descriptor, load_roles(root))
     fleet = load_fleet(root)
@@ -690,6 +735,14 @@ def run(args: argparse.Namespace) -> int:
 
     role_env = descriptor.get("role_env", {})
     drop_env = set(role_env.values())
+    if structured:
+        # The host retains the receipt. Also remove bindings inherited from a
+        # parent worker so a candidate-only adapter cannot accidentally use one.
+        drop_env.update({
+            BOUND_TASK_ENV, BOUND_LEASE_ENV, BOUND_ATTEMPT_ENV,
+            BOUND_PATH_ENV, BOUND_EXPIRES_ENV, "WO_RUNTIME_CLAIM_JSON",
+        })
+        drop_env.update(key for key in os.environ if key.startswith("WO_RUNTIME_CLAIM_"))
     state: dict[str, RoleState] = {n: RoleState() for n in roles}
     caps = {n: cap_for(n) for n in roles}
     runtime_limits = {
@@ -739,6 +792,29 @@ def run(args: argparse.Namespace) -> int:
                             i.heartbeat_thread.join(timeout=0.2)
                         rc = i.process.returncode
                         trigger_name = i.trigger[0]
+                        effective_rc = 124 if i.timed_out else int(rc or 0)
+                        committed = False
+                        result_error = ""
+                        if i.structured_output is not None:
+                            if effective_rc < 0:
+                                effective_rc = 128 - effective_rc
+                            if rc == 0 and not i.timed_out:
+                                try:
+                                    if i.claim is None:
+                                        raise StructuredResultError("structured result has no host claim")
+                                    result = read_structured_result(i.structured_output)
+                                    # False means a NEW commit; True means an
+                                    # idempotent replay. Both are accepted.
+                                    complete_claim(workspace, i.claim, result)
+                                    committed = True
+                                    log(args, "info", f"[supervisor] role={name} task={i.claim.task_id} "
+                                        "structured result committed")
+                                except (StructuredResultError, QueueContractError, QueueStateError,
+                                        QueueBusyError, OSError, ValueError) as exc:
+                                    effective_rc = 1
+                                    result_error = "runtime_structured_result_rejected"
+                                    log(args, "error", f"[supervisor] role={name} trigger={trigger_name} "
+                                        f"structured result rejected: {exc}", file=sys.stderr)
                         had_quota_state = bool(load_quota_state(root, args.runtime, name))
                         if i.log_state.quota_seen and rc != 0:
                             persisted = load_quota_state(root, args.runtime, name)
@@ -793,7 +869,7 @@ def run(args: argparse.Namespace) -> int:
                                 )
                                 s.quota_notified = False
                                 clear_quota_state(root, args.runtime, name)
-                        if i.claim is not None:
+                        if i.claim is not None and not committed:
                             if i.timed_out:
                                 release_invocation_claim(
                                     workspace,
@@ -812,10 +888,10 @@ def run(args: argparse.Namespace) -> int:
                                 release_invocation_claim(
                                     workspace,
                                     i,
-                                    reason=f"runtime_exit_without_terminal_result:{rc}",
+                                    reason=result_error or f"runtime_exit_without_terminal_result:{rc}",
                                     increment_attempt=True,
                                 )
-                        completed_codes.append(124 if i.timed_out else int(rc or 0))
+                        completed_codes.append(effective_rc)
                 s.inflight = alive
                 now_ts = time.time()
                 quota_state = load_quota_state(root, args.runtime, name)
@@ -878,19 +954,39 @@ def run(args: argparse.Namespace) -> int:
                             )
                             continue
                         context_trigger = receipt.path if receipt is not None else trig[0]
-                        cmd = build_command(
-                            descriptor,
-                            root,
-                            cfg,
-                            resolve_model(descriptor, name, cfg, fleet, args.model),
-                            role_name=name,
-                            trigger_path=context_trigger,
-                            claim=receipt,
-                        )
+                        prepared = None
+                        try:
+                            if structured:
+                                if receipt is None:
+                                    raise StructuredResultError("json-file requires a queue task with a host claim")
+                                prepared = prepare_structured_output(workspace, receipt)
+                            cmd = build_command(
+                                descriptor,
+                                root,
+                                cfg,
+                                resolve_model(descriptor, name, cfg, fleet, args.model),
+                                role_name=name,
+                                trigger_path=context_trigger,
+                                claim=receipt,
+                                structured_output=prepared,
+                            )
+                        except (StructuredResultError, OSError, ValueError, SystemExit) as exc:
+                            if receipt is not None:
+                                try:
+                                    requeue_claim(workspace, receipt,
+                                                  reason="runtime_preparation_failed",
+                                                  increment_attempt=False)
+                                except (QueueContractError, QueueStateError, QueueBusyError, OSError, ValueError):
+                                    pass
+                            s.blocked.add(trig[0])
+                            completed_codes.append(1)
+                            log(args, "error", f"[supervisor] role={name} trigger={trig[0]} "
+                                f"preparation failed; blocked until restart: {exc}", file=sys.stderr)
+                            continue
                         try:
                             proc = subprocess.Popen(
                                 cmd, cwd=root, text=True,
-                                env=runtime_env(root, drop_env, claim_env(receipt)),
+                                env=runtime_env(root, drop_env, {} if structured else claim_env(receipt)),
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,
                                 bufsize=1,
@@ -913,6 +1009,8 @@ def run(args: argparse.Namespace) -> int:
                             # spin retrying the same broken command -- one role's
                             # launch failure must not crash the whole supervisor.
                             s.blocked.add(trig[0])
+                            if structured:
+                                completed_codes.append(1)
                             log(args, "error", f"[supervisor] role={name} trigger={trig[0]} LAUNCH FAILED: "
                                 f"{type(exc).__name__}: {exc}", file=sys.stderr)
                             log(args, "error", f"[supervisor]   cmd[0]={cmd[0]!r}  cwd={root}", file=sys.stderr)
@@ -949,6 +1047,7 @@ def run(args: argparse.Namespace) -> int:
                             log_thread=log_thread,
                             heartbeat_thread=heartbeat_thread,
                             claim=receipt,
+                            structured_output=prepared,
                             deadline_monotonic=(
                                 time.monotonic() + runtime_limits[name]
                                 if runtime_limits[name] > 0

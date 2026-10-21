@@ -14,6 +14,7 @@ import argparse, json, os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 from wo_runtime.runtime.context import resolve_context_prepend
+from wo_runtime.runtime.structured import structured_output_enabled
 from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, load_workspace
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[2]
@@ -74,6 +75,10 @@ def test_runtime(name: str) -> None:
     check(isinstance(desc.get("kinds"), list) and desc["kinds"], f"{name}: declares kinds")
     if "supervisor" in desc["kinds"]:
         check("exec" in desc, f"{name}: supervisor kind has exec block")
+        structured = structured_output_enabled(desc)
+        check(True, f"{name}: result protocol and placeholders are valid")
+    else:
+        structured = False
 
     # 1b. context prepend (optional): files exist, roles known, helper produces marker
     if "context" in desc:
@@ -168,13 +173,20 @@ def test_runtime(name: str) -> None:
                             "--role", role, "--once", "--dry-run", "--bin", "stub-bin"])
             (sb / "tasks/ready-wk" / "t.json").write_text("{}", encoding="utf-8")
             r = sup_run("wk")
-            check("would run:" in r.stdout and "stub-bin" in r.stdout, f"{name}: supervisor schedules queued work")
+            check(r.returncode == 0 and "would run:" in r.stdout and "stub-bin" in r.stdout,
+                  f"{name}: supervisor previews queued work")
+            if structured:
+                check("{output_schema}" in r.stdout and "{output_path}" in r.stdout,
+                      f"{name}: structured dry-run previews schema and output placeholders")
+                check(not (sb / ".run" / "data" / "runtime-invocations").exists(),
+                      f"{name}: structured dry-run does not allocate invocation artifacts")
             # exclude: gw final WITH sibling => not scheduled
             (sb / "resgw" / "x.final.json").write_text("{}", encoding="utf-8")
             (sb / "sent" / "x.json").write_text("{}", encoding="utf-8")
             check("would run:" not in sup_run("gw").stdout, f"{name}: supervisor skips excluded gateway final")
             (sb / "sent" / "x.json").unlink()
-            check("would run:" in sup_run("gw").stdout, f"{name}: supervisor schedules gateway final once sibling gone")
+            if not structured:
+                check("would run:" in sup_run("gw").stdout, f"{name}: supervisor schedules gateway final once sibling gone")
             # concurrency: 2 ready files + max-inflight 2 => 2 launches in one scan
             (sb / "tasks/ready-wk" / "t2.json").write_text("{}", encoding="utf-8")
             rc = run([PY, str(CLI), "runtime", "supervisor", "--workspace-root", str(sb),

@@ -64,11 +64,16 @@ claim. Unfenced or forged results are moved to `results/_invalid/`.
 
 There is no legacy fallback, automatic contract upgrade, or unclaimed task
 completion. Tasks without `queue_contract: "queue.v2"` are rejected.
-Supervised children remain compatible because the supervisor pre-claims and
+With the default `worker` result protocol, supervised children remain compatible
+because the supervisor pre-claims and
 sets `WO_RUNTIME_TASK_ID`, `WO_RUNTIME_CLAIM_LEASE`,
 `WO_RUNTIME_CLAIM_ATTEMPT`, `WO_RUNTIME_CLAIM_EXPIRES_AT`, and
 `WO_RUNTIME_CLAIM_PATH`. Direct daemons and interactive roles must capture the
 JSON receipt and pass its lease and attempt.
+
+The opt-in [`json-file` protocol](STRUCTURED-OUTPUT.md) keeps the receipt in the
+supervisor. Its child receives task context and an output schema, then writes a
+candidate result for the host to validate and commit through the same boundary.
 
 Orchestrator-generated dependency failures, canonical media aliases, and manual
 human-review terminals use the same claim/result binding. They do not bypass
@@ -110,8 +115,9 @@ requeue a task that already has a terminal result.
 ## Supervisor binding and deadlines
 
 For queue-task triggers, the supervisor claims the exact trigger before
-launching a child. Product/task context, queue environment, heartbeat, and
-terminal ownership therefore refer to the same task. Runtime limit resolution
+launching a child. Task context, heartbeat, and terminal ownership therefore
+refer to the same task. The `worker` protocol also binds the receipt in the
+child's environment; `json-file` retains it in the host. Runtime limit resolution
 is:
 
 1. `runtime/fleet.json[role].max_runtime_seconds`;
