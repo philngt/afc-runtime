@@ -104,6 +104,11 @@ before the optional instance result hook and before writing the terminal file.
 Use the instance hook only for cross-artifact or domain invariants that JSON
 Schema cannot express.
 
+Provider structured output can improve contract adherence, but valid structure
+does not prove factual correctness, artifact quality, or successful delivery.
+Keep runtime validation, claim receipts, and instance correctness checks at the
+commit boundary.
+
 ### 4. Compile the pipeline DAG from data
 
 Each pipeline stage should declare:
@@ -114,9 +119,34 @@ Each pipeline stage should declare:
 - fanout axes, conditions, timeout/retry policy, and root selection;
 - the output contract and only the task fields required by that stage.
 
-There must be exactly one logical root. Fanout joins must be deterministic.
-Validate the compiled graph for duplicate ids, missing dependencies, cycles or
-self-dependencies, and ambiguous roots before executing workers.
+Choose task boundaries where work needs its own output contract, retry,
+parallel execution, or human gate. A task can autonomously use several tools,
+inspect evidence, and refine its result within one attempt. A separate queue
+task is unnecessary for each reasoning step; use durable checkpoints where
+independent scheduling or recovery is useful.
+
+Stage declarations may appear in any order. The compiler validates all stage
+references before conditions and sorts prerequisites before consumers, retaining
+an already valid declaration order. `inputsFrom` binds an existing upstream
+result without adding a scheduling edge; the source must already be a direct
+or transitive `dependsOn` prerequisite. Otherwise planning fails with
+`input_without_dependency`.
+
+Conditions and fanout are resolved at compile time from the request and
+defaults. References to known stages that emit no tasks are pruned; a consumer
+is omitted when all its declared dependencies are omitted. An active dependency
+without a compatible fanout variant skips that consumer variant. These rules
+do not provide routing on later task results.
+
+There must be one emitted root whose dependency ancestry covers every emitted
+branch. An explicit fanout root is valid only when one variant emits; mutually
+exclusive conditional roots are valid when only one emits. Without an explicit
+emitted root, the compiler requires one terminal task. Add a final join for
+multiple branches instead of relying on alphabetical or declaration order.
+Unknown references and cycles in stage references fail before workers run.
+See [Core planner](CORE.md#example-unordered-fanout-and-join) for an unordered
+fanout/join example and migration guidance. These compiler guarantees do not
+change the standalone `validate-dag` command's documented scope.
 
 ### 5. Configure roles, fleet, and providers
 
@@ -198,7 +228,8 @@ the runtime adapter checks. At minimum, verify:
 2. all JSON files parse and all referenced files exist;
 3. contract ids resolve and representative valid/invalid artifacts behave as
    expected;
-4. a representative request compiles to the expected DAG and exactly one root;
+4. representative condition and fanout combinations compile to the expected
+   DAG, with input dependency paths and one root covering every emitted branch;
 5. every fleet role has a valid runtime descriptor and hard runtime budget;
 6. a receipt-bound worker accepts a valid claim and rejects partial, stale, or
    escaping bindings;
