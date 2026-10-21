@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from wo_runtime.core.validation import validate_identifier
+from wo_runtime.plans import PlanPublicationError, load_request_plan, require_complete_plan, task_is_published
 
 
 _TASK_AREAS = {
@@ -90,6 +91,30 @@ class RequestStatusReader:
         safe_request_id = validate_identifier(request_id, "request.id")
         ordered_ids: list[str] = []
         projected: dict[str, TaskStatus] = {}
+        try:
+            manifest = load_request_plan(self.data_root, safe_request_id, require_committed=False)
+            if manifest is not None:
+                expected_tasks = manifest["plan"]["tasks"]
+                try:
+                    load_request_plan(self.data_root, safe_request_id)
+                except PlanPublicationError:
+                    waiting = tuple(self._from_envelope(safe_request_id, task, state="queued") for task in expected_tasks)
+                    return RequestStatus(safe_request_id, "queued", waiting, 0, len(waiting))
+        except PlanPublicationError:
+            # A manifest being staged or an inconsistent publication must not
+            # project partial terminal files as request success.
+            return RequestStatus(safe_request_id, "queued", (), 0, 0)
+
+        materialized = list(self._materialized_tasks(safe_request_id))
+        complete_plan = True
+        try:
+            require_complete_plan(self.data_root, safe_request_id, [task for task, _ in materialized])
+        except PlanPublicationError:
+            complete_plan = False
+        valid_materialized_ids = {
+            task.get("id") for task, _ in materialized
+            if task_is_published(self.data_root, task)
+        }
 
         for value in expected_tasks:
             task_id = str(value.get("id") or value.get("task_id") or "").strip()
@@ -106,7 +131,9 @@ class RequestStatusReader:
             )
             ordered_ids.append(task_id)
 
-        for envelope, state in self._materialized_tasks(safe_request_id):
+        for envelope, state in materialized:
+            if not task_is_published(self.data_root, envelope):
+                continue
             task_id = validate_identifier(envelope.get("id"), "task.id")
             candidate = self._from_envelope(safe_request_id, envelope, state=state)
             current = projected.get(task_id)
@@ -120,6 +147,10 @@ class RequestStatusReader:
             safe_request_id,
             known_task_ids=set(projected),
         ):
+            if manifest is not None and (task_id not in projected or task_id not in valid_materialized_ids):
+                continue
+            if not complete_plan and manifest is None:
+                continue
             current = projected.get(task_id)
             envelope = dict(current.envelope) if current else {"id": task_id}
             state = "success" if result.get("status") == "success" else "failed"
@@ -143,7 +174,7 @@ class RequestStatusReader:
         )
         if failed:
             state = "failed"
-        elif tasks and successful == len(tasks):
+        elif tasks and successful == len(tasks) and complete_plan:
             state = "success"
         elif any(task.state == "processing" for task in tasks):
             state = "processing"
@@ -164,6 +195,8 @@ class RequestStatusReader:
 
     def exists(self, request_id: str) -> bool:
         safe_request_id = validate_identifier(request_id, "request.id")
+        if (self.data_root / "plans" / safe_request_id).exists():
+            return True
         if (self.data_root / "inbox" / f"{safe_request_id}.json").is_file():
             return True
         if (self.data_root / "inbox" / "processed" / f"{safe_request_id}.json").is_file():

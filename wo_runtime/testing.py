@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
+import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from wo_runtime.artifacts import (
     ContentAddressedStore,
     idempotent_write_json,
 )
+from wo_runtime.core.pipeline import PlanError, validate_tasks
 from wo_runtime.core.validation import result_digest, validate_terminal_result_binding
 from wo_runtime.status import RequestStatusReader
 from wo_runtime.worker import (
@@ -25,7 +28,89 @@ from wo_runtime.worker import (
 )
 
 
+def run_dag_validation_selftest() -> int:
+    """Check graph validity independently of queue publication and workers."""
+
+    def task(task_id: str, dependencies: list[str], *, root: bool = False) -> dict:
+        return {
+            "queue_contract": "queue.v2",
+            "id": task_id,
+            "req_id": "DAG",
+            "capability": "wk",
+            "stage": "synthetic",
+            "depends_on": dependencies,
+            "is_root": root,
+        }
+
+    fanout = [
+        task("DAG.start", []),
+        task("DAG.left", ["DAG.start"]),
+        task("DAG.right", ["DAG.start"]),
+        task("DAG.join", ["DAG.right", "DAG.left"], root=True),
+    ]
+    deep = [
+        task(f"DAG.T{i}", [f"DAG.T{i - 1}"] if i else [], root=i == 2499)
+        for i in range(2500)
+    ]
+    cases = [
+        ("fanout and join", fanout, ""),
+        ("deep acyclic graph", deep, ""),
+        ("disconnected acyclic graph", [task("DAG.a", [], root=True), task("DAG.b", [])], ""),
+        ("two-node cycle", [task("DAG.a", ["DAG.b"]), task("DAG.b", ["DAG.a"], root=True)], "dag_invalid:cycle:"),
+        ("three-node cycle", [task("DAG.a", ["DAG.c"]), task("DAG.b", ["DAG.a"]), task("DAG.c", ["DAG.b"], root=True)], "dag_invalid:cycle:"),
+        ("self dependency", [task("DAG.a", ["DAG.a"], root=True)], "dag_invalid:self_dependency:DAG.a"),
+        ("missing dependency", [task("DAG.a", ["DAG.missing"], root=True)], "dag_invalid:missing_dependency:DAG.a:DAG.missing"),
+        ("duplicate ids", [task("DAG.a", [], root=True), task("DAG.a", [])], "dag_invalid:duplicate_task_ids"),
+        ("missing root", [task("DAG.a", [])], "dag_invalid:root_count:0"),
+        ("multiple roots", [task("DAG.a", [], root=True), task("DAG.b", [], root=True)], "dag_invalid:root_count:2"),
+    ]
+    for label, tasks, expected in cases:
+        original = copy.deepcopy(tasks)
+        error = ""
+        try:
+            validate_tasks(tasks)
+        except PlanError as exc:
+            error = str(exc)
+        if tasks != original:
+            print(f"synthetic selftest: DAG validation mutated {label}", file=sys.stderr)
+            return 1
+        if expected == "dag_invalid:cycle:":
+            cycle = error.removeprefix(expected).split("->")
+            if (
+                not error.startswith(expected)
+                or len(cycle) != len(tasks) + 1
+                or cycle[0] != cycle[-1]
+                or set(cycle) != {item["id"] for item in tasks}
+            ):
+                print(f"synthetic selftest: {label} lacks a useful cycle diagnostic: {error}", file=sys.stderr)
+                return 1
+            reordered = copy.deepcopy(list(reversed(tasks)))
+            for item in reordered:
+                item["depends_on"].reverse()
+            reordered_error = ""
+            try:
+                validate_tasks(reordered)
+            except PlanError as exc:
+                reordered_error = str(exc)
+            if reordered_error != error:
+                print(f"synthetic selftest: {label} diagnostic depends on task order", file=sys.stderr)
+                return 1
+        elif error != expected:
+            print(f"synthetic selftest: {label}: expected {expected!r}, got {error!r}", file=sys.stderr)
+            return 1
+    return 0
+
+
 def run_synthetic_selftest() -> int:
+    from wo_runtime import plan_testing
+
+    publication = unittest.TextTestRunner(verbosity=1).run(
+        unittest.defaultTestLoader.loadTestsFromModule(plan_testing)
+    )
+    if not publication.wasSuccessful():
+        return 1
+    if run_dag_validation_selftest() != 0:
+        return 1
     cli = Path(__file__).resolve().parents[1] / "bin" / "wo-runtime"
     with tempfile.TemporaryDirectory(prefix="wo-runtime-selftest-") as raw:
         root = Path(raw)

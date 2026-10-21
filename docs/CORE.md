@@ -21,15 +21,58 @@ vendor/woafc-runtime/bin/wo-runtime core validate-dag --workspace-root "$PWD" --
 Behavior:
 
 - `plan --dry-run` prints the compiled DAG and writes nothing.
-- `plan --write` writes task files to `.run/data/tasks/pending/`.
+- `plan --write` publishes a complete request plan and its pending task files
+  under the configured data root (default `.run/data`).
 - `plan-inbox --once` compiles at most one `.run/data/inbox/*.json` request,
-  writes tasks, moves the request to `inbox/processed/`, and appends a `planned`
-  event.
+  publishes the plan, moves the request to `inbox/processed/`, and appends a
+  `planned` or `plan_replayed` event.
 - `context` builds a compact task context with task, resolved inputs, domain,
   pipeline, product kind, contract refs, guidance refs, audits, and artifact refs.
 - `contract-path` resolves runtime, instance, and domain contract indexes.
 - `validate-dag` checks one planned request for exactly one root task, duplicate
-  ids, missing dependencies, and self-dependencies.
+  ids, missing dependencies, self-dependencies, and cycles across multiple tasks.
+
+## Request plan publication
+
+`plan --write` and `plan-inbox` validate the full DAG before publication. The
+runtime writes an immutable `plans/<request-id>/manifest.json`, materializes
+each task in `tasks/pending/`, then writes `plans/<request-id>/committed.json`
+last. Every managed task carries the manifest's SHA-256 as `plan_digest`.
+The manifest and marker use `request_plan.v1`. Paths are relative to the
+configured data root.
+
+The marker is the visibility boundary: queue mutation, scheduler discovery,
+orchestration, and status readers reject or defer uncommitted work. Request
+finalization also requires the complete task set declared by the manifest;
+a missing sibling cannot make a partial request appear complete.
+
+Publication is replay-safe:
+
+- Repeating an identical request and compiled plan is a no-op after commitment,
+  even when tasks have moved to ready, claimed, or done.
+- If publication stops before the marker, rerunning the same input resumes the
+  immutable pending files and publishes the marker after all tasks exist.
+- A different request or compiled plan with the same request ID is rejected.
+  Existing task destinations and results are also protected from overwrite.
+- Inbox conflicts emit `plan_rejected` and archive the incoming request without
+  replacing existing work or its final result. Interrupted I/O leaves the input
+  in the inbox for retry. A parse/compile failure creates a failed final only
+  when the request ID has no existing state.
+
+Request publication locks do not expire while their valid owner process is
+alive. Dead owners can be recovered immediately; incomplete lock metadata has
+a 15-minute grace period before recovery. A retry does not recreate missing
+task files after commitment: that inconsistency remains blocked for inspection.
+
+This boundary binds the compiled graph and the task fields used for scheduling,
+input references, output-contract ID, and root/manual behavior. It does not pin
+contract file contents, instance code, guidance, provider configuration, or all
+custom task fields. Execution snapshots are a separate future phase described
+in [Evolution](EVOLUTION.md).
+
+Existing `queue.v2` tasks without a request manifest remain supported. A managed
+task cannot opt out by removing `plan_digest`; the request directory still
+requires the binding. A task with a digest but no manifest is also rejected.
 
 ## Required Instance Data
 

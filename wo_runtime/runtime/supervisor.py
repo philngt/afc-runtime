@@ -46,6 +46,7 @@ from wo_runtime.queue.commands import (
 )
 from wo_runtime.core.validation import QueueContractError
 from wo_runtime.queue.locking import QueueBusyError
+from wo_runtime.plans import queue_trigger_is_published
 from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, Workspace, load_workspace
 
 for _stream in (sys.stdout, sys.stderr):
@@ -172,6 +173,8 @@ def list_triggers(root: Path, cfg: dict, ignore: set[str]) -> list[tuple[str, in
             if path.name.startswith(".") or not path.is_file() or rel in ignore:
                 continue
             if is_excluded(root, cfg, path):
+                continue
+            if not queue_trigger_is_published(path):
                 continue
             st = path.stat()
             out.append((rel, st.st_mtime_ns, st.st_size))

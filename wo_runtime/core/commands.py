@@ -10,11 +10,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from wo_runtime.artifacts import idempotent_write_json
 from wo_runtime.core.context import build_context
 from wo_runtime.core.context_packs import compact_worker_context, inline_input_max_bytes
 from wo_runtime.core.contracts import contract_path
 from wo_runtime.core.pipeline import PlanError, compile_request, validate_tasks
 from wo_runtime.core.validation import QueueContractError, safe_file, validate_identifier, validate_request_envelope
+from wo_runtime.plans import PlanConflictError, publish_plan, request_has_state
+from wo_runtime.queue.locking import task_lock
 from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, Workspace, ensure_data_root, load_workspace
 
 
@@ -26,13 +29,6 @@ def _workspace(args: argparse.Namespace) -> Workspace:
     workspace = load_workspace(args.workspace_root, args.workspace_config)
     ensure_data_root(workspace)
     return workspace
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
 
 
 def _event(workspace: Workspace, payload: dict[str, Any]) -> None:
@@ -69,18 +65,6 @@ def _before_plan_request(workspace: Workspace, request: dict[str, Any], request_
     return updated
 
 
-def _write_tasks(workspace: Workspace, tasks: list[dict[str, Any]]) -> None:
-    pending = workspace.data_root / "tasks" / "pending"
-    pending.mkdir(parents=True, exist_ok=True)
-    for task in tasks:
-        try:
-            task_id = validate_identifier(task.get("id"), "task.id")
-            path = safe_file(pending, task_id, field="task.id")
-        except QueueContractError as exc:
-            raise PlanError(f"dag_invalid:{exc}") from exc
-        _write_json(path, task)
-
-
 def _write_failed_final(workspace: Workspace, req_id: str, error: str, *, request_ref: str | None = None) -> None:
     payload = {
         "task_id": f"{req_id}.final",
@@ -92,7 +76,9 @@ def _write_failed_final(workspace: Workspace, req_id: str, error: str, *, reques
     if request_ref:
         payload["requestRef"] = request_ref
     path = safe_file(workspace.data_root / "results", req_id, suffix=".final.json", field="request.id")
-    _write_json(path, payload)
+    with task_lock(workspace.data_root / "plans", req_id, purpose="plan-failure", stale_seconds=float("inf")):
+        if not request_has_state(workspace.data_root, req_id):
+            idempotent_write_json(path, payload)
 
 
 def _failure_request_id(candidate: str, source: Path) -> str:
@@ -113,6 +99,14 @@ def _processed_target(path: Path) -> Path:
     return processed / f"{path.stem}.{stamp}{path.suffix}"
 
 
+def _archive_inbox(path: Path) -> None:
+    try:
+        path.replace(_processed_target(path))
+    except FileNotFoundError:
+        # Another planner may have completed the same committed replay.
+        pass
+
+
 def _plan_request(workspace: Workspace, request: dict[str, Any]) -> dict[str, Any]:
     plan = compile_request(workspace, request)
     validate_tasks(plan["tasks"])
@@ -125,14 +119,15 @@ def cmd_plan(args: argparse.Namespace) -> int:
     request = _before_plan_request(workspace, _load_request(path), path)
     plan = _plan_request(workspace, request)
     if args.write:
-        _write_tasks(workspace, plan["tasks"])
+        created = publish_plan(workspace, request, plan)
+        req_id = request.get("id") or request.get("req_id")
         _event(workspace, {
-            "event": "planned",
-            "req_id": request.get("id"),
+            "event": "planned" if created else "plan_replayed",
+            "req_id": req_id,
             "pipelineId": plan["pipeline"]["id"],
             "task_count": len(plan["tasks"]),
         })
-        print(f"planned {request.get('id')}: {len(plan['tasks'])} task(s)")
+        print(f"{'planned' if created else 'already planned'} {req_id}: {len(plan['tasks'])} task(s)")
     else:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
     return 0
@@ -142,21 +137,29 @@ def _plan_inbox_item(workspace: Workspace, path: Path, *, dry_run: bool) -> tupl
     req_id = path.stem
     try:
         request = _before_plan_request(workspace, _load_request(path), path)
-        req_id = str(request.get("id") or req_id)
+        req_id = str(request.get("id") or request.get("req_id") or req_id)
         plan = _plan_request(workspace, request)
     except Exception as exc:
         error = f"parse_error:{exc}"
         if not dry_run:
             req_id = _failure_request_id(req_id, path)
             _write_failed_final(workspace, req_id, error, request_ref=str(path))
-            path.replace(_processed_target(path))
+            _archive_inbox(path)
             _event(workspace, {"event": "plan_failed", "req_id": req_id, "error": error})
         return req_id, 0
     if not dry_run:
-        _write_tasks(workspace, plan["tasks"])
-        path.replace(_processed_target(path))
+        try:
+            created = publish_plan(workspace, request, plan)
+        except PlanConflictError as exc:
+            # Reject the new input without replacing the original request's
+            # work or final. Interrupted I/O is deliberately not caught here:
+            # leave that input in the inbox so the publication can resume.
+            _archive_inbox(path)
+            _event(workspace, {"event": "plan_rejected", "req_id": req_id, "error": str(exc)})
+            return req_id, 0
+        _archive_inbox(path)
         _event(workspace, {
-            "event": "planned",
+            "event": "planned" if created else "plan_replayed",
             "req_id": req_id,
             "pipelineId": plan["pipeline"]["id"],
             "task_count": len(plan["tasks"]),
@@ -247,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--request-file", required=True)
     mode = plan.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="Print the compiled plan without writing tasks")
-    mode.add_argument("--write", action="store_true", help="Write compiled tasks to tasks/pending")
+    mode.add_argument("--write", action="store_true", help="Publish a complete, replay-safe request plan")
     plan.set_defaults(func=cmd_plan)
 
     inbox = sub.add_parser("plan-inbox", parents=[workspace], help="Compile requests from inbox")

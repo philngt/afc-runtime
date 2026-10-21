@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from wo_runtime.runtime.context import resolve_context_prepend
+from wo_runtime.plans import queue_trigger_is_published
 
 
 STUCK_THRESHOLD = 3
@@ -105,6 +106,8 @@ class WaitForWork:
                     if path.name.startswith(".") or rel in ignore:
                         continue
                     if is_excluded(rel):
+                        continue
+                    if not queue_trigger_is_published(path):
                         continue
                     return rel
             return None

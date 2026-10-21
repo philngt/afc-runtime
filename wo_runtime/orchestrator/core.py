@@ -26,6 +26,7 @@ from wo_runtime.core.validation import (
     validate_terminal_result_binding,
 )
 from wo_runtime.queue.locking import QueueBusyError, task_lock
+from wo_runtime.plans import PlanPublicationError, require_complete_plan, task_is_published
 from wo_runtime.workspace import DEFAULT_WORKSPACE_CONFIG, load_and_prepare
 
 
@@ -179,6 +180,8 @@ class Orchestrator:
             except Exception as exc:
                 self.quarantine(claimed_path, f"task_contract_error:{exc}")
                 continue
+            if not task_is_published(self.paths.data_root, task):
+                continue
             try:
                 with task_lock(self.paths.data_root, task_id, purpose="reconcile"):
                     if not claimed_path.exists():
@@ -195,6 +198,8 @@ class Orchestrator:
         try:
             task = read_json(claimed_path)
             validate_task_path(claimed_path, task)
+            if not task_is_published(self.paths.data_root, task):
+                return
             result = read_json(result_path)
             validate_terminal_result_binding(task, result, expected_task_id=task_id)
         except Exception as exc:
@@ -240,6 +245,8 @@ class Orchestrator:
                     return
                 current = read_json(claimed_path)
                 validate_task_path(claimed_path, current)
+                if not task_is_published(self.paths.data_root, current):
+                    return
                 result_path = self.paths.p("results", f"{task_id}.json")
                 if result_path.exists():
                     return
@@ -306,6 +313,8 @@ class Orchestrator:
             except Exception as exc:
                 self.quarantine(claimed_path, f"task_contract_error:{exc}")
                 continue
+            if not task_is_published(self.paths.data_root, task):
+                continue
             try:
                 claim_meta = validate_claim_binding(task, expected_task_id=task_id)
             except QueueContractError as exc:
@@ -357,6 +366,8 @@ class Orchestrator:
             task_path = safe_file(self.paths.p("tasks", "done"), task_id, field="task.id")
             if not task_path.exists():
                 continue
+            if not task_is_published(self.paths.data_root, read_json(task_path)):
+                continue
             backup_dir.mkdir(parents=True, exist_ok=True)
             stamp = now().strftime("%Y%m%dT%H%M%SZ")
             shutil.move(str(result_path), str(backup_dir / f"{result_path.stem}.{stamp}.json"))
@@ -379,6 +390,8 @@ class Orchestrator:
             except Exception as exc:
                 self.quarantine(task_path, f"task_contract_error:{exc}")
                 continue
+            if not task_is_published(self.paths.data_root, task):
+                continue
             missing = [field for field in REQUIRED_FIELDS if field not in task]
             if missing:
                 self.quarantine(task_path, f"missing_fields:{','.join(missing)}")
@@ -398,6 +411,8 @@ class Orchestrator:
                 validate_task_path(task_path, task)
             except Exception as exc:
                 self.quarantine(task_path, f"task_contract_error_after_hook:{exc}")
+                continue
+            if not task_is_published(self.paths.data_root, task):
                 continue
 
             hold_until = parse_ts(str(task.get("hold_until") or ""))
@@ -511,6 +526,8 @@ class Orchestrator:
             except Exception as exc:
                 self.quarantine(task_path, f"task_contract_error_after_hook:{exc}")
                 continue
+            if not task_is_published(self.paths.data_root, task):
+                continue
             try:
                 workspace = load_and_prepare(self.paths.workspace_root)
                 pack_cfg = workspace.config.get("contextPacks") if isinstance(workspace.config.get("contextPacks"), dict) else {}
@@ -573,6 +590,11 @@ class Orchestrator:
         for req_id, items in reqs.items():
             final_path = self.paths.p("results", f"{req_id}.final.json")
             if final_path.exists():
+                continue
+            try:
+                require_complete_plan(self.paths.data_root, req_id, [task for _, task in items])
+            except PlanPublicationError as exc:
+                self.log({"event": "finalization_deferred", "req_id": req_id, "reason": str(exc)})
                 continue
             if not all(area == self.paths.p("tasks", "done") for area, _ in items):
                 continue

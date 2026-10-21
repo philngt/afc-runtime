@@ -26,6 +26,7 @@ from wo_runtime.core.validation import (
     validate_task_envelope,
 )
 from wo_runtime.queue.locking import QueueBusyError, task_lock
+from wo_runtime.plans import PlanPublicationError, require_published_task
 from wo_runtime.workspace import Workspace, load_and_prepare
 
 
@@ -268,6 +269,7 @@ def claim_task(
         existing_path = safe_file(claimed, bound_task_id, field="task.id")
         if existing_path.exists():
             existing = _read_json(existing_path)
+            require_published_task(data_root, existing)
             meta = _claim_meta(existing)
             expected_lease = requested_lease
             if (
@@ -288,6 +290,12 @@ def claim_task(
             continue
         parsed = _read_json(path)
         validate_task_envelope(parsed)
+        try:
+            require_published_task(data_root, parsed)
+        except PlanPublicationError:
+            if bound_task_id:
+                raise
+            continue
         parsed_task_id = validate_identifier(parsed.get("id"), "task.id")
         if parsed.get("manualOnly") is True:
             if bound_task_id:
@@ -300,6 +308,11 @@ def claim_task(
         with task_lock(data_root, parsed_task_id, purpose="claim"):
             if not path.exists():
                 continue
+            parsed = _read_json(path)
+            validate_task_envelope(parsed)
+            require_published_task(data_root, parsed)
+            if parsed.get("id") != parsed_task_id or parsed.get("capability") != capability:
+                raise QueueStateError(f"task_changed_before_claim:{parsed_task_id}")
             target = safe_file(claimed, parsed_task_id, field="task.id")
             try:
                 path.replace(target)
@@ -359,6 +372,7 @@ def requeue_claim(
         if not claimed_path.exists():
             return False
         task = _read_json(claimed_path)
+        require_published_task(data_root, task)
         meta = _claim_meta(task)
         if str(meta.get("lease_id") or "") != receipt.lease_id:
             return False
@@ -502,6 +516,9 @@ def _terminal_commit(
         raise QueueStateError(f"result_digest_mismatch:expected={expected_digest}:actual={digest}")
 
     with task_lock(data_root, task_id, purpose=f"terminal-{payload.get('status')}"):
+        owner_path = claimed_path if claimed_path.exists() else done_path
+        if owner_path.exists():
+            require_published_task(data_root, _read_json(owner_path))
         if result_path.exists():
             existing = _read_json(result_path)
             existing_digest = str(
@@ -524,6 +541,7 @@ def _terminal_commit(
             raise QueueStateError(f"task_not_claimed:{task_id}")
         task = _read_json(claimed_path)
         validate_task_envelope(task)
+        require_published_task(data_root, task)
         if str(task.get("id") or "") != task_id:
             raise QueueStateError(f"claimed_task_id_mismatch:{task_id}")
         meta = _claim_meta(task)
@@ -552,6 +570,7 @@ def _terminal_commit(
         # The validation hook can perform I/O. Re-check the hard lease at the
         # actual commit boundary rather than relying only on the pre-hook check.
         _require_active_lease(meta, task_id)
+        require_published_task(data_root, task)
         _write_json_atomic(result_path, payload)
         claimed_path.replace(done_path)
     _event(
@@ -773,6 +792,7 @@ def promote(args: Any) -> int:
     try:
         task = _read_json(path)
         validate_task_envelope(task)
+        require_published_task(data_root, task)
         task_id = validate_identifier(task.get("id"), "task.id")
         capability = validate_capability(task.get("capability"))
         if path.name != f"{task_id}.json":
