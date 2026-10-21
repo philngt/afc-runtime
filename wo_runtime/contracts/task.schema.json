@@ -58,6 +58,11 @@
       "default": false,
       "description": "When true, generic/model worker claim commands must not reserve this task."
     },
+    "plan_digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "Binding to a committed request_plan.v1 manifest. Absent on unmanaged legacy tasks."
+    },
     "attempt": {
       "type": "integer",
       "minimum": 0

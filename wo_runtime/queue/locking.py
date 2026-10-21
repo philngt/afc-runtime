@@ -10,6 +10,9 @@ from typing import Iterator
 from wo_runtime.core.validation import safe_file, validate_identifier
 
 
+_ORPHAN_LOCK_GRACE_SECONDS = 900.0
+
+
 class QueueBusyError(RuntimeError):
     pass
 
@@ -29,10 +32,17 @@ def _pid_alive(pid: int) -> bool:
 def _stale_lock(path: Path, stale_seconds: float) -> bool:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        payload = {}
-    pid = int(payload.get("pid") or 0)
-    created = float(payload.get("created") or 0.0)
+        pid = int(payload.get("pid") or 0)
+        created = float(payload.get("created") or 0.0)
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        pid, created = 0, 0.0
+    if pid <= 0:
+        # O_EXCL precedes the metadata write. A crash in that interval must
+        # remain recoverable even when a caller disables live-lock age expiry.
+        # Use mtime and a grace period so a publisher still writing metadata
+        # is not mistaken for an abandoned ownerless lock.
+        stale_seconds = min(stale_seconds, _ORPHAN_LOCK_GRACE_SECONDS)
+        created = 0.0
     try:
         age = time.time() - created if created else time.time() - path.stat().st_mtime
     except FileNotFoundError:

@@ -15,6 +15,25 @@ and bounded-runtime guarantees.
 - `manualOnly: true` tasks cannot be claimed by the generic/model-worker claim
   command.
 
+## Request plan binding
+
+New planner publications add the optional `plan_digest` field to task envelopes.
+It binds a task to a committed `request_plan.v1` manifest under the configured
+data root. The runtime checks membership, scheduling fields, input references,
+the output-contract ID, and boolean root/manual flags against that manifest.
+
+Prepared tasks are not executable until the final commit marker exists.
+Promotion, claim, requeue, and terminal publication enforce this boundary, as
+do orchestrator recovery and finalization. Scheduler and Stop-hook discovery
+skip uncommitted tasks. A committed request requires its full declared task set
+before finalization or a successful status projection.
+
+Existing `queue.v2` tasks with no manifest and no `plan_digest` retain their
+behavior. This is compatibility for unmanaged plan publication, not for older
+queue contracts. Removing a managed task's digest or manifest does not turn it
+into an unmanaged task. See [Core](CORE.md#request-plan-publication) for replay,
+interruption recovery, and publication conflicts.
+
 ## Claim receipt
 
 Claim one exact task and request a machine-readable receipt:

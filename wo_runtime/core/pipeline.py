@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import itertools
 import json
+from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from typing import Any
 
@@ -524,3 +525,15 @@ def validate_tasks(tasks: list[dict[str, Any]]) -> None:
                 raise PlanError(f"dag_invalid:missing_dependency:{task_id}:{dep_id}")
             if dep_id == task_id:
                 raise PlanError(f"dag_invalid:self_dependency:{task_id}")
+    # Normalize traversal order for stable diagnostics without changing the
+    # caller's task envelopes or dependency order. graphlib uses an iterative
+    # cycle search, so valid deep pipelines do not hit Python's recursion limit.
+    graph = {
+        str(task["id"]): sorted(str(dep) for dep in task.get("depends_on") or [])
+        for task in sorted(tasks, key=lambda task: str(task["id"]))
+    }
+    try:
+        TopologicalSorter(graph).prepare()
+    except CycleError as exc:
+        cycle = "->".join(exc.args[1])
+        raise PlanError(f"dag_invalid:cycle:{cycle}") from exc
