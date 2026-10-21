@@ -972,8 +972,11 @@ def run_synthetic_selftest() -> int:
             print(timeout_run.stderr or timeout_run.stdout, file=sys.stderr)
             return 1
 
+    from wo_runtime.pipeline_testing import run_pipeline_selftest
     from wo_runtime.runtime.structured_selftest import run_structured_selftest
 
+    if run_pipeline_selftest() != 0:
+        return 1
     if run_structured_selftest() != 0:
         return 1
     print("[wo-runtime selftest] OK")

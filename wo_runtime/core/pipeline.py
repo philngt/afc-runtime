@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import heapq
 import itertools
 import json
+from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,7 @@ from wo_runtime.core.domain import (
 from wo_runtime.core.validation import (
     QUEUE_CONTRACT_VERSION,
     QueueContractError,
+    validate_capability,
     validate_identifier,
     validate_request_envelope,
     validate_resource_id,
@@ -306,15 +309,81 @@ def _stage_applies(stage: dict[str, Any], request: dict[str, Any], product: dict
 
 
 def _stage_refs(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
     refs: list[str] = []
-    for item in _as_list(value):
+    for item in value if isinstance(value, list) else [value]:
         if isinstance(item, dict):
-            raw = item.get("stage") or item.get("number") or item.get("task")
+            raw = next((item[key] for key in ("stage", "number", "task")
+                        if item.get(key) not in (None, "")), None)
         else:
             raw = item
-        if raw:
-            refs.append(str(raw))
-    return refs
+        if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+            raise QueueContractError("stage_reference:invalid")
+        refs.append(validate_identifier(str(raw), "stage_reference"))
+    return _unique(refs)
+
+
+def _ordered_stages(pipeline: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate the full profile, then compile prerequisites before consumers.
+
+    Declaration order breaks ties only. Processing one ready stage at a time
+    preserves the task order of profiles that are already topologically ordered.
+    inputsFrom participates in compilation order without adding queue edges.
+    """
+    prefix = f"profile_invalid:{pipeline.get('id') or ''}"
+    stages: dict[str, dict[str, Any]] = {}
+    for index, raw in enumerate(pipeline["stages"]):
+        if not isinstance(raw, dict):
+            raise PlanError(f"{prefix}:stage_not_object:{index}")
+        stage = dict(raw)
+        number = stage.get("number")
+        try:
+            if isinstance(number, bool) or not isinstance(number, (str, int, float)):
+                raise QueueContractError("number:invalid")
+            number = validate_identifier(str(number), "number")
+            validate_capability(stage.get("capability"))
+        except QueueContractError as exc:
+            raise PlanError(f"{prefix}:stage:{index}:{exc}") from exc
+        if number in stages:
+            raise PlanError(f"{prefix}:duplicate_stage:{number}")
+        if "isRoot" in stage and not isinstance(stage["isRoot"], bool):
+            raise PlanError(f"{prefix}:invalid_is_root:{number}")
+        stage["number"] = number
+        for field in ("dependsOn", "inputsFrom"):
+            try:
+                stage[field] = _stage_refs(stage.get(field))
+            except QueueContractError as exc:
+                raise PlanError(f"{prefix}:invalid_reference:{number}:{field}:{exc}") from exc
+        stages[number] = stage
+
+    graph: dict[str, list[str]] = {}
+    for number, stage in stages.items():
+        for field in ("dependsOn", "inputsFrom"):
+            for ref in stage[field]:
+                if ref not in stages:
+                    raise PlanError(f"{prefix}:unknown_stage:{number}:{field}:{ref}")
+                if ref == number:
+                    raise PlanError(f"{prefix}:self_reference:{number}:{field}")
+        graph[number] = _unique(stage["dependsOn"] + stage["inputsFrom"])
+    sorter = TopologicalSorter(graph)
+    try:
+        sorter.prepare()
+    except CycleError as exc:
+        cycle = "->".join(exc.args[1])
+        raise PlanError(f"{prefix}:stage_cycle:{cycle}") from exc
+
+    positions = {number: index for index, number in enumerate(stages)}
+    ready = [(positions[number], number) for number in sorter.get_ready()]
+    heapq.heapify(ready)
+    ordered = []
+    while ready:
+        _, number = heapq.heappop(ready)
+        ordered.append(stages[number])
+        sorter.done(number)
+        for next_number in sorter.get_ready():
+            heapq.heappush(ready, (positions[next_number], next_number))
+    return ordered
 
 
 def _axis_product(axes: list[str], values_by_axis: dict[str, list[str]]) -> list[dict[str, str]]:
@@ -406,6 +475,34 @@ def _task_base(
     return task
 
 
+def _upstream_task_ids(task_id: str, tasks_by_id: dict[str, dict[str, Any]]) -> set[str]:
+    visited: set[str] = set()
+    pending = [task_id]
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        pending.extend(tasks_by_id[current]["depends_on"])
+    return visited
+
+
+def _validate_compiled_workflow(tasks: list[dict[str, Any]]) -> None:
+    """Check profile guarantees without tightening the generic queue validator."""
+    tasks_by_id = {task["id"]: task for task in tasks}
+    root = next(task for task in tasks if task.get("is_root"))
+    uncovered = sorted(set(tasks_by_id) - _upstream_task_ids(root["id"], tasks_by_id))
+    if uncovered:
+        raise PlanError(f"dag_invalid:root_does_not_cover_tasks:{root['id']}:{','.join(uncovered)}")
+    for task in tasks:
+        extra_inputs = {item["task_id"] for item in task["inputs"]} - set(task["depends_on"])
+        if not extra_inputs:
+            continue
+        ungated = sorted(extra_inputs - _upstream_task_ids(task["id"], tasks_by_id))
+        if ungated:
+            raise PlanError(f"dag_invalid:input_without_dependency:{task['id']}:{','.join(ungated)}")
+
+
 def compile_request(workspace: Workspace, request: dict[str, Any]) -> dict[str, Any]:
     try:
         validate_request_envelope(request)
@@ -421,21 +518,17 @@ def compile_request(workspace: Workspace, request: dict[str, Any]) -> dict[str, 
         pipeline_id=pipeline_id,
         pipeline=pipeline,
     )
-    stages = [stage for stage in pipeline.get("stages", []) if isinstance(stage, dict)]
+    stages = _ordered_stages(pipeline)
     variants_by_stage: dict[str, list[dict[str, Any]]] = {}
     tasks: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
 
     for stage in stages:
-        number = str(stage.get("number") or "").strip()
-        capability = str(stage.get("capability") or "").strip()
-        if not number or not capability:
-            warnings.append({"code": "stage_skipped_invalid", "stage": stage})
-            continue
+        number = stage["number"]
         if not _stage_applies(stage, request, product):
             variants_by_stage[number] = []
             continue
-        depends_refs = _stage_refs(stage.get("dependsOn"))
+        depends_refs = stage["dependsOn"]
         if depends_refs and not _matching_variants(depends_refs, {}, variants_by_stage):
             variants_by_stage[number] = []
             warnings.append({"code": "stage_skipped_no_emitted_dependencies", "stage": number})
@@ -452,6 +545,17 @@ def compile_request(workspace: Workspace, request: dict[str, Any]) -> dict[str, 
             continue
         stage_variants: list[dict[str, Any]] = []
         for current_axes in axis_variants:
+            dep_variants = _matching_variants(depends_refs, current_axes, variants_by_stage)
+            unmatched = [ref for ref in depends_refs if variants_by_stage[ref]
+                         and not _matching_variants([ref], current_axes, variants_by_stage)]
+            if unmatched:
+                warnings.append({
+                    "code": "stage_variant_skipped_unmatched_dependencies",
+                    "stage": number,
+                    "axes": current_axes,
+                    "dependencies": unmatched,
+                })
+                continue
             task_id = f"{request_id}.{number}{_variant_suffix(current_axes, axes)}"
             task = _task_base(
                 task_id=task_id,
@@ -462,9 +566,8 @@ def compile_request(workspace: Workspace, request: dict[str, Any]) -> dict[str, 
                 pipeline_id=pipeline_id,
                 axes=current_axes,
             )
-            dep_variants = _matching_variants(depends_refs, current_axes, variants_by_stage)
             task["depends_on"] = [str(variant["task"]["id"]) for variant in dep_variants]
-            input_refs = _stage_refs(stage.get("inputsFrom"))
+            input_refs = stage["inputsFrom"]
             source_variants = dep_variants + _matching_variants(input_refs, current_axes, variants_by_stage)
             seen_inputs: set[tuple[str, str]] = set()
             inputs = []
@@ -481,19 +584,22 @@ def compile_request(workspace: Workspace, request: dict[str, Any]) -> dict[str, 
             stage_variants.append(variant)
             tasks.append(task)
         variants_by_stage[number] = stage_variants
-        if bool(stage.get("isRoot")) and stage_variants:
+        if stage.get("isRoot"):
             for variant in stage_variants:
-                variant["task"].pop("is_root", None)
-            root_variant = sorted(stage_variants, key=lambda item: str(item["task"].get("id") or ""))[-1]
-            root_variant["task"]["is_root"] = True
+                variant["task"]["is_root"] = True
 
     roots = [task for task in tasks if task.get("is_root")]
     if len(roots) > 1:
         raise PlanError(f"dag_invalid:multiple_roots:{','.join(str(task.get('id')) for task in roots)}")
     if not roots and tasks:
-        tasks[-1]["is_root"] = True
-        warnings.append({"code": "root_auto_selected", "taskId": tasks[-1]["id"]})
+        prerequisite_ids = {dep for task in tasks for dep in task["depends_on"]}
+        terminals = [task for task in tasks if task["id"] not in prerequisite_ids]
+        if len(terminals) != 1:
+            raise PlanError(f"dag_invalid:ambiguous_roots:{','.join(str(task['id']) for task in terminals)}")
+        terminals[0]["is_root"] = True
+        warnings.append({"code": "root_auto_selected", "taskId": terminals[0]["id"]})
     validate_tasks(tasks)
+    _validate_compiled_workflow(tasks)
     return {
         "request": copy.deepcopy(request),
         "domain": {"id": domain_id},
